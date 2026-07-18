@@ -1,0 +1,25 @@
+{
+  "sources": [
+    {
+      "method": "table",
+      "dataset": "curated.claims_enriched"
+    },
+    {
+      "method": "table",
+      "dataset": "raw.customers"
+    },
+    {
+      "method": "parquet",
+      "dataset": "s3://insurance-lake/raw/transactions/"
+    }
+  ],
+  "targets": [
+    {
+      "method": "saveAsTable",
+      "dataset": "curated.fraud_flagged_claims"
+    }
+  ],
+  "joins": [],
+  "column_renames": [],
+  "sql_blocks": []
+}

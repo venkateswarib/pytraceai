@@ -1,0 +1,150 @@
+{
+  "sources": [
+    {
+      "dataset": "raw.claims",
+      "method": "table",
+      "description": "Raw claims data containing claim transactions, amounts, dates, loss types, and claimant information from the P&C insurance system.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "dataset": "raw.policy",
+      "method": "table",
+      "description": "Policy master data containing policy holder details, coverage terms, deductibles, effective dates, and underwriting regions.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "targets": [
+    {
+      "dataset": "curated.claims_enriched",
+      "method": "saveAsTable",
+      "description": "Enriched claims dataset with policy information, standardized column names, derived business metrics for downstream analytics and reporting.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "joins": [
+    {
+      "left": "claims_df",
+      "right": "policy_df",
+      "join_key": "policy_id",
+      "join_type": "left",
+      "description": "Enriches each claim record with corresponding policy details while retaining all claims even if policy data is missing.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "column_renames": [
+    {
+      "old_name": "claim_amount",
+      "new_name": "claim_amt_usd",
+      "business_reason": "Standardizes monetary column naming to enterprise convention with explicit currency designation.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "claim_date",
+      "new_name": "claim_dt",
+      "business_reason": "Aligns date column naming to enterprise standard abbreviation format for consistency.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "policy_holder_name",
+      "new_name": "customer_full_name",
+      "business_reason": "Renames to customer-centric terminology reflecting enterprise data model for downstream CRM integration.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "policy_type",
+      "new_name": "product_line_cd",
+      "business_reason": "Standardizes to enterprise product taxonomy using code designation for consistent cross-system reporting.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "coverage_limit",
+      "new_name": "max_coverage_amt_usd",
+      "business_reason": "Clarifies the business meaning as maximum coverage amount with explicit currency for financial reporting.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "deductible_amount",
+      "new_name": "deductible_amt_usd",
+      "business_reason": "Standardizes monetary column naming with currency designation for financial downstream consumers.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "effective_date",
+      "new_name": "policy_effective_dt",
+      "business_reason": "Adds policy prefix to disambiguate from claim dates and follows enterprise date naming standard.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "expiration_date",
+      "new_name": "policy_expiration_dt",
+      "business_reason": "Adds policy prefix for clarity and aligns to enterprise date column naming convention.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "underwriting_region",
+      "new_name": "uw_region_cd",
+      "business_reason": "Abbreviates to standard enterprise code format for regional underwriting classification.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "sql_blocks": [],
+  "transformations": [
+    {
+      "type": "cast",
+      "description": "Converts claim_amt_usd to Decimal(15,2) to ensure precise monetary calculations for financial reporting."
+    },
+    {
+      "type": "cast",
+      "description": "Converts max_coverage_amt_usd to Decimal(15,2) for consistent precision in coverage limit calculations."
+    },
+    {
+      "type": "cast",
+      "description": "Converts deductible_amt_usd to Decimal(15,2) to maintain precision in deductible and payable amount computations."
+    },
+    {
+      "type": "derive",
+      "description": "Calculates net_payable_amt as claim amount minus deductible with a floor of zero to represent actual insurance payout liability."
+    },
+    {
+      "type": "derive",
+      "description": "Flags is_catastrophic as true for claims exceeding $500,000 threshold to identify high-severity events for special handling."
+    },
+    {
+      "type": "derive",
+      "description": "Adds etl_load_ts with current timestamp to track data lineage and enable incremental processing auditing."
+    },
+    {
+      "type": "filter",
+      "description": "Removes records with null claim amounts to ensure data quality for downstream financial calculations and reporting."
+    }
+  ],
+  "business_summary": "This ETL pipeline enriches raw property and casualty insurance claims with policy master data, standardizes column names to enterprise conventions, and computes key business metrics including net payable amounts and catastrophic claim flags. The curated output supports downstream actuarial analysis, financial reserves calculation, claims adjudication workflows, and executive dashboards requiring integrated claims-policy information.",
+  "overall_confidence": 1.0,
+  "needs_review": []
+}

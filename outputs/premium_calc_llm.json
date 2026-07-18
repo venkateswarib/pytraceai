@@ -1,0 +1,117 @@
+{
+  "sources": [
+    {
+      "dataset": "prod.policy_master",
+      "description": "Master policy records containing policy identifiers, product codes, territory codes, written premiums, and term dates for all insurance policies."
+    },
+    {
+      "dataset": "prod.policy_endorsements",
+      "description": "Policy endorsement transactions that capture mid-term adjustments and additional premium charges applied to existing policies."
+    },
+    {
+      "dataset": "jdbc:sqlserver://rating-engine:1433;databaseName=RatingDB/dbo.RateFactors",
+      "description": "Rating engine database table containing base rates and rate multipliers by product and territory for premium calculation."
+    },
+    {
+      "dataset": "reference.territory_rate_factors",
+      "description": "Reference data table providing territory-specific rate multipliers used to adjust premiums based on geographic risk."
+    }
+  ],
+  "targets": [
+    {
+      "dataset": "prod.premium_calculated",
+      "description": "Aggregated earned premium summary by product and territory with ranking, used for financial reporting and actuarial analysis."
+    }
+  ],
+  "joins": [
+    {
+      "left": "active_policies_df",
+      "right": "endorsement_summary_df",
+      "join_key": "policy_id",
+      "join_type": "left",
+      "description": "Enriches active policies with aggregated endorsement premium adjustments to capture mid-term policy changes."
+    },
+    {
+      "left": "policy_with_endorsements_df",
+      "right": "rate_factors_df",
+      "join_key": "product_cd",
+      "join_type": "left",
+      "description": "Applies rating engine base rates and multipliers to policies based on product and territory for premium calculation."
+    },
+    {
+      "left": "policy_with_endorsements_df",
+      "right": "rate_factors_df",
+      "join_key": "territory_cd",
+      "join_type": "left",
+      "description": "Applies rating engine base rates and multipliers to policies based on product and territory for premium calculation."
+    },
+    {
+      "left": "rated_df",
+      "right": "territory_df",
+      "join_key": "territory_cd",
+      "join_type": "left",
+      "description": "Applies territory-specific rate multipliers from reference data to adjust premiums for geographic risk factors."
+    }
+  ],
+  "column_renames": [
+    {
+      "old_name": "sum(endorsement_premium)",
+      "new_name": "total_endorsement_premium",
+      "business_reason": "Provides clear business terminology for aggregated endorsement premium amounts added to base policy premium."
+    },
+    {
+      "old_name": "sum(earned_premium)",
+      "new_name": "total_earned_premium",
+      "business_reason": "Standardizes naming for aggregated earned premium metrics used in financial reporting and analysis."
+    },
+    {
+      "old_name": "avg(earned_premium)",
+      "new_name": "avg_earned_premium",
+      "business_reason": "Provides clear metric name for average earned premium calculation by product and territory."
+    },
+    {
+      "old_name": "count(policy_id)",
+      "new_name": "policy_count",
+      "business_reason": "Simplifies column name to represent the number of policies contributing to each territory and product aggregation."
+    },
+    {
+      "old_name": "sum(adjusted_premium)",
+      "new_name": "total_written_premium",
+      "business_reason": "Aligns with insurance industry terminology for total written premium before earned premium calculation."
+    }
+  ],
+  "sql_blocks": [
+    "SELECT product_cd, territory_cd, base_rate, rate_multiplier FROM dbo.RateFactors WHERE active_flag = 1"
+  ],
+  "transformations": [
+    {
+      "type": "filter",
+      "description": "Filters policy master records to include only policies with ACTIVE status for premium calculation."
+    },
+    {
+      "type": "aggregate",
+      "description": "Aggregates endorsement premiums by policy to calculate total mid-term adjustments for each policy."
+    },
+    {
+      "type": "derive",
+      "description": "Computes adjusted premium by adding written premium and endorsement premium, then multiplying by rate multiplier from rating engine."
+    },
+    {
+      "type": "derive",
+      "description": "Calculates earned premium by prorating adjusted premium based on policy term months divided by twelve."
+    },
+    {
+      "type": "derive",
+      "description": "Adds calculation timestamp to track when premium calculations were performed for audit purposes."
+    },
+    {
+      "type": "aggregate",
+      "description": "Aggregates earned premiums, written premiums, and policy counts by product code and territory code for summary reporting."
+    },
+    {
+      "type": "window",
+      "description": "Ranks territories within each product by total earned premium to identify top-performing geographic markets."
+    }
+  ],
+  "business_summary": "This P&C premium calculation job computes earned premiums for active insurance policies by applying rating engine factors and territory multipliers, then aggregating results by product line and territory. It combines policy master data with endorsement adjustments, applies rate factors from the rating database, and calculates earned premium based on policy term proration. The output summary table with territory rankings is consumed by financial reporting systems, actuarial analysis teams, and executive dashboards for monitoring product and geographic performance."
+}

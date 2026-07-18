@@ -1,0 +1,150 @@
+{
+  "sources": [
+    {
+      "dataset": "raw.claims",
+      "method": "table",
+      "description": "Raw insurance claims data containing claim identifiers, amounts, dates, loss types, and claimant information.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "dataset": "raw.policy",
+      "method": "table",
+      "description": "Policy master data containing policy holder details, coverage limits, deductibles, effective dates, and underwriting region information.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "targets": [
+    {
+      "dataset": "curated.claims_enriched",
+      "method": "saveAsTable",
+      "description": "Enriched claims dataset with policy attributes, standardized column names, derived business metrics, and catastrophic claim indicators for downstream analytics and reporting.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "joins": [
+    {
+      "left": "claims_df",
+      "right": "policy_df",
+      "join_key": "policy_id",
+      "join_type": "left",
+      "description": "Enriches claims with policy master data to provide full context of coverage limits, policy holder information, and underwriting details.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "column_renames": [
+    {
+      "old_name": "claim_amount",
+      "new_name": "claim_amt_usd",
+      "business_reason": "Standardizes monetary field naming to enterprise convention with explicit currency designation.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "claim_date",
+      "new_name": "claim_dt",
+      "business_reason": "Adopts enterprise standard date field naming convention using dt suffix.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "policy_holder_name",
+      "new_name": "customer_full_name",
+      "business_reason": "Aligns to customer-centric naming convention used across enterprise data models.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "policy_type",
+      "new_name": "product_line_cd",
+      "business_reason": "Renames to business terminology reflecting insurance product line categorization with code suffix.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "coverage_limit",
+      "new_name": "max_coverage_amt_usd",
+      "business_reason": "Clarifies field represents maximum coverage amount in USD per enterprise monetary standards.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "deductible_amount",
+      "new_name": "deductible_amt_usd",
+      "business_reason": "Standardizes deductible field to enterprise monetary naming convention with currency designation.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "effective_date",
+      "new_name": "policy_effective_dt",
+      "business_reason": "Adds policy prefix for clarity and adopts enterprise date field naming convention.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "expiration_date",
+      "new_name": "policy_expiration_dt",
+      "business_reason": "Adds policy prefix for clarity and adopts enterprise date field naming convention.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    },
+    {
+      "old_name": "underwriting_region",
+      "new_name": "uw_region_cd",
+      "business_reason": "Abbreviates to standard underwriting region code format used in enterprise data warehouse.",
+      "confidence": 1.0,
+      "source": "both",
+      "needs_review": false
+    }
+  ],
+  "sql_blocks": [],
+  "transformations": [
+    {
+      "type": "cast",
+      "description": "Casts claim_amt_usd to DecimalType with precision 15 and scale 2 for consistent monetary representation."
+    },
+    {
+      "type": "cast",
+      "description": "Casts max_coverage_amt_usd to DecimalType with precision 15 and scale 2 for consistent monetary representation."
+    },
+    {
+      "type": "cast",
+      "description": "Casts deductible_amt_usd to DecimalType with precision 15 and scale 2 for consistent monetary representation."
+    },
+    {
+      "type": "derive",
+      "description": "Calculates net_payable_amt as the claim amount minus deductible with a floor of zero to represent actual insurance payout."
+    },
+    {
+      "type": "derive",
+      "description": "Flags is_catastrophic as true when claim amount exceeds $500,000 threshold for special handling and reserving."
+    },
+    {
+      "type": "derive",
+      "description": "Adds etl_load_ts timestamp to track when each record was processed through the ETL pipeline."
+    },
+    {
+      "type": "filter",
+      "description": "Removes records with null claim amounts to ensure data quality for downstream financial reporting."
+    }
+  ],
+  "business_summary": "This P&C insurance ETL pipeline enriches raw claims data by joining with policy master information to provide complete claim context including coverage limits, policy holder details, and underwriting region. The script standardizes column names to enterprise conventions, casts monetary fields to precise decimal types, derives net payable amounts and catastrophic claim flags, and filters out invalid records. The curated output supports downstream actuarial analysis, claims reserving, financial reporting, and catastrophic event management.",
+  "overall_confidence": 1.0,
+  "needs_review": []
+}

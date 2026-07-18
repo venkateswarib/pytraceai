@@ -1,0 +1,360 @@
+"""
+PyTraceAi - ast_parser.py
+
+Walks a PySpark script's AST and extracts lineage-relevant information:
+  - sources         : tables/paths being read
+  - targets         : tables/paths being written
+  - joins           : join operations with left/right DataFrames, key, type
+  - column_renames  : withColumnRenamed() calls
+  - sql_blocks      : raw SQL strings passed to spark.sql()
+"""
+
+import ast
+import textwrap
+from pprint import pformat
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def parse_script(source_code: str) -> dict:
+    """
+    Parse a PySpark script string and return a lineage dict:
+      {
+        "sources":        [ "raw.claims", ... ],
+        "targets":        [ "curated.claims_enriched", ... ],
+        "joins":          [ {"left": "claims_df", "right": "policy_df",
+                             "join_key": "policy_id == policy_id",
+                             "join_type": "left"}, ... ],
+        "column_renames": [ {"old_name": "claim_amount",
+                             "new_name": "claim_amt_usd"}, ... ],
+        "sql_blocks":     [ "SELECT ...", ... ],
+      }
+    """
+    tree = ast.parse(source_code)
+    visitor = _LineageVisitor()
+    visitor.visit(tree)
+    return {
+        "sources":        visitor.sources,
+        "targets":        visitor.targets,
+        "joins":          visitor.joins,
+        # AST visits outer chain calls first, so renames arrive reversed.
+        "column_renames": list(reversed(visitor.column_renames)),
+        "sql_blocks":     visitor.sql_blocks,
+    }
+
+
+def parse_file(file_path: str) -> dict:
+    """Read a PySpark script from disk and return its lineage dict."""
+    with open(file_path, "r", encoding="utf-8") as fh:
+        source_code = fh.read()
+    return parse_script(source_code)
+
+
+# ---------------------------------------------------------------------------
+# Internal AST visitor
+# ---------------------------------------------------------------------------
+
+class _LineageVisitor(ast.NodeVisitor):
+    """Walks every Call node in the AST and classifies PySpark operations."""
+
+    def __init__(self):
+        self.sources:        list[dict] = []
+        self.targets:        list[dict] = []
+        self.joins:          list[dict] = []
+        self.column_renames: list[dict] = []
+        self.sql_blocks:     list[str]  = []
+
+    # ---- entry point -------------------------------------------------------
+
+    def visit_Call(self, node: ast.Call):
+        """Dispatch to specialised handlers based on the call signature."""
+        attr_chain = _get_attr_chain(node)
+
+        # spark.read.table("...") / spark.read.load("...") / spark.read.csv(...)
+        if self._is_read_call(attr_chain):
+            self._handle_read(node, attr_chain)
+
+        # df.write.saveAsTable("...") / df.write.save("...") / df.write.csv(...)
+        elif self._is_write_call(attr_chain):
+            self._handle_write(node, attr_chain)
+
+        # df.join(other, on, how=...)
+        elif attr_chain and attr_chain[-1] == "join":
+            self._handle_join(node)
+
+        # df.withColumnRenamed("old", "new")
+        # Collected in reverse chain order; reversed once in parse_script.
+        elif attr_chain and attr_chain[-1] == "withColumnRenamed":
+            self._handle_rename(node)
+
+        # spark.sql("SELECT ...")
+        elif self._is_sql_call(attr_chain):
+            self._handle_sql(node)
+
+        self.generic_visit(node)
+
+    # ---- read --------------------------------------------------------------
+
+    READ_METHODS = {"table", "load", "csv", "json", "parquet", "orc",
+                    "text", "jdbc"}
+
+    def _is_read_call(self, chain: list[str]) -> bool:
+        return (
+            len(chain) >= 2
+            and "read" in chain
+            and chain[-1] in self.READ_METHODS
+        )
+
+    def _handle_read(self, node: ast.Call, chain: list[str]):
+        method   = chain[-1]
+        dataset  = _first_string_arg(node)
+        if dataset:
+            self.sources.append({"method": method, "dataset": dataset})
+
+    # ---- write -------------------------------------------------------------
+
+    WRITE_METHODS = {"saveAsTable", "save", "csv", "json", "parquet",
+                     "orc", "insertInto", "jdbc"}
+
+    def _is_write_call(self, chain: list[str]) -> bool:
+        return (
+            len(chain) >= 2
+            and "write" in chain
+            and chain[-1] in self.WRITE_METHODS
+        )
+
+    def _handle_write(self, node: ast.Call, chain: list[str]):
+        method  = chain[-1]
+        dataset = _first_string_arg(node)
+        if dataset:
+            self.targets.append({"method": method, "dataset": dataset})
+
+    # ---- join --------------------------------------------------------------
+
+    def _handle_join(self, node: ast.Call):
+        args = node.args
+        kwargs = {kw.keyword if hasattr(kw, 'keyword') else kw.arg: kw.value
+                  for kw in node.keywords}
+
+        # left DataFrame — object the .join() is called on
+        left = _receiver_name(node)
+
+        # right DataFrame — first positional arg
+        right = _name_from_arg(args[0]) if args else None
+
+        # join condition — second positional arg (or "on" keyword)
+        on_node = args[1] if len(args) > 1 else kwargs.get("on")
+        join_key = _normalize_join_key(on_node) if on_node else None
+
+        # join type — "how" keyword or third positional arg
+        how_node = kwargs.get("how") if kwargs.get("how") else (
+            args[2] if len(args) > 2 else None
+        )
+        join_type = ast.literal_eval(how_node) if how_node and isinstance(
+            how_node, ast.Constant) else (
+            _expr_to_str(how_node) if how_node else "inner"
+        )
+
+        self.joins.append({
+            "left":      left,
+            "right":     right,
+            "join_key":  join_key,
+            "join_type": join_type,
+        })
+
+    # ---- withColumnRenamed -------------------------------------------------
+
+    def _handle_rename(self, node: ast.Call):
+        args = node.args
+        if len(args) >= 2:
+            old = ast.literal_eval(args[0]) if isinstance(args[0], ast.Constant) else None
+            new = ast.literal_eval(args[1]) if isinstance(args[1], ast.Constant) else None
+            if old and new:
+                self.column_renames.append({"old_name": old, "new_name": new})
+
+    # ---- spark.sql() -------------------------------------------------------
+
+    def _is_sql_call(self, chain: list[str]) -> bool:
+        return len(chain) >= 2 and chain[-1] == "sql"
+
+    def _handle_sql(self, node: ast.Call):
+        sql_str = _first_string_arg(node)
+        if sql_str:
+            self.sql_blocks.append(textwrap.dedent(sql_str).strip())
+
+
+# ---------------------------------------------------------------------------
+# Helper utilities
+# ---------------------------------------------------------------------------
+
+def _get_attr_chain(node: ast.Call) -> list[str]:
+    """
+    Flatten a chained method call to a list of names, passing through
+    intermediate Call nodes so multi-step chains like:
+      df.write.mode("overwrite").format("parquet").saveAsTable("t")
+    resolve to ["df", "write", "mode", "format", "saveAsTable"].
+    """
+    parts = []
+    current = node.func
+    while True:
+        if isinstance(current, ast.Attribute):
+            parts.append(current.attr)
+            current = current.value
+        elif isinstance(current, ast.Call):
+            # intermediate call — step into its func to keep climbing
+            current = current.func
+        elif isinstance(current, ast.Name):
+            parts.append(current.id)
+            break
+        else:
+            break
+    parts.reverse()
+    return parts
+
+
+def _first_string_arg(node: ast.Call) -> str | None:
+    """Return the first positional string literal argument, or None."""
+    if node.args and isinstance(node.args[0], ast.Constant) and isinstance(
+        node.args[0].value, str
+    ):
+        return node.args[0].value
+    return None
+
+
+def _name_from_arg(node: ast.expr) -> str | None:
+    """Return the Name id if the node is a simple variable reference."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return ast.unparse(node)
+    return ast.unparse(node) if node else None
+
+
+def _receiver_name(node: ast.Call) -> str | None:
+    """Return the name of the object a method is called on."""
+    func = node.func
+    if isinstance(func, ast.Attribute):
+        return ast.unparse(func.value)
+    return None
+
+
+def _normalize_join_key(node: ast.expr) -> str | list | None:
+    """
+    Reduce a join condition to a bare column name (or list of names) where
+    possible, falling back to the raw unparsed expression only when necessary.
+
+    Handles:
+      df["col"] == other["col"]   ->  "col"
+      df.col == other.col         ->  "col"
+      "col"  (string literal)     ->  "col"
+      ["col1", "col2"]            ->  ["col1", "col2"]
+      F.col("col") == …           ->  "col"
+      complex / unrecognised      ->  raw ast.unparse string (fallback)
+    """
+    if node is None:
+        return None
+
+    # Plain string: join(other, "policy_id")
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+
+    # List of strings: join(other, ["col1", "col2"])
+    if isinstance(node, ast.List):
+        cols = [elt.value for elt in node.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)]
+        return cols if cols else ast.unparse(node)
+
+    # Comparison: df["col"] == other["col"]  /  df.col == other.col
+    if (isinstance(node, ast.Compare)
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)):
+        left_col  = _extract_col_name(node.left)
+        right_col = _extract_col_name(node.comparators[0])
+        if left_col and right_col:
+            # same column on both sides (canonical case)
+            return left_col if left_col == right_col else f"{left_col} = {right_col}"
+
+    # F.col("col") standing alone
+    if isinstance(node, ast.Call) and _get_attr_chain(node)[-1:] == ["col"]:
+        val = _first_string_arg(node)
+        if val:
+            return val
+
+    return ast.unparse(node)
+
+
+def _extract_col_name(node: ast.expr) -> str | None:
+    """Pull the bare column name out of df["col"], df.col, or F.col("col")."""
+    # df["col"]  — subscript with string key
+    if isinstance(node, ast.Subscript):
+        s = node.slice
+        if isinstance(s, ast.Constant) and isinstance(s.value, str):
+            return s.value
+    # df.col_name  — attribute access
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    # F.col("col") or col("col")
+    if isinstance(node, ast.Call):
+        return _first_string_arg(node)
+    # bare string constant
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    return None
+
+
+def _expr_to_str(node: ast.expr) -> str | None:
+    """Unparse an AST expression back to a readable string."""
+    if node is None:
+        return None
+    try:
+        return ast.unparse(node)
+    except Exception:
+        return repr(node)
+
+
+# ---------------------------------------------------------------------------
+# CLI test harness
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    import sys
+    import json
+    import os
+    from pathlib import Path
+
+    script_path = sys.argv[1] if len(sys.argv) > 1 else \
+        "sample_scripts/claims_etl.py"
+
+    print(f"\n{'='*60}")
+    print(f"  PyTraceAi — AST Parser")
+    print(f"  Script: {script_path}")
+    print(f"{'='*60}\n")
+
+    result = parse_file(script_path)
+
+    sections = [
+        ("SOURCES",        result["sources"]),
+        ("TARGETS",        result["targets"]),
+        ("JOINS",          result["joins"]),
+        ("COLUMN RENAMES", result["column_renames"]),
+        ("SQL BLOCKS",     result["sql_blocks"]),
+    ]
+
+    for label, data in sections:
+        print(f"--- {label} ({len(data)}) ---")
+        if not data:
+            print("  (none found)")
+        else:
+            for item in data:
+                print(" ", item if isinstance(item, str) else json.dumps(item, indent=4))
+        print()
+
+    # Write JSON output to outputs/
+    os.makedirs("outputs", exist_ok=True)
+    stem = Path(script_path).stem
+    output_path = f"outputs/{stem}_lineage.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, indent=2)
+    print(f"Output saved to: {output_path}")

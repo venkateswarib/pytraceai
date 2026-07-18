@@ -1,0 +1,65 @@
+{
+  "sources": [
+    {
+      "method": "table",
+      "dataset": "raw.claims"
+    },
+    {
+      "method": "table",
+      "dataset": "raw.policy"
+    }
+  ],
+  "targets": [
+    {
+      "method": "saveAsTable",
+      "dataset": "curated.claims_enriched"
+    }
+  ],
+  "joins": [
+    {
+      "left": "claims_df",
+      "right": "policy_df",
+      "join_key": "policy_id",
+      "join_type": "left"
+    }
+  ],
+  "column_renames": [
+    {
+      "old_name": "claim_amount",
+      "new_name": "claim_amt_usd"
+    },
+    {
+      "old_name": "claim_date",
+      "new_name": "claim_dt"
+    },
+    {
+      "old_name": "policy_holder_name",
+      "new_name": "customer_full_name"
+    },
+    {
+      "old_name": "policy_type",
+      "new_name": "product_line_cd"
+    },
+    {
+      "old_name": "coverage_limit",
+      "new_name": "max_coverage_amt_usd"
+    },
+    {
+      "old_name": "deductible_amount",
+      "new_name": "deductible_amt_usd"
+    },
+    {
+      "old_name": "effective_date",
+      "new_name": "policy_effective_dt"
+    },
+    {
+      "old_name": "expiration_date",
+      "new_name": "policy_expiration_dt"
+    },
+    {
+      "old_name": "underwriting_region",
+      "new_name": "uw_region_cd"
+    }
+  ],
+  "sql_blocks": []
+}

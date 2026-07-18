@@ -1,0 +1,29 @@
+{
+  "sources": [],
+  "targets": [],
+  "joins": [
+    {
+      "left": "active_policies_df",
+      "right": "endorsement_summary_df",
+      "join_key": "policy_id",
+      "join_type": "left"
+    },
+    {
+      "left": "policy_with_endorsements_df",
+      "right": "rate_factors_df",
+      "join_key": [
+        "product_cd",
+        "territory_cd"
+      ],
+      "join_type": "left"
+    },
+    {
+      "left": "rated_df",
+      "right": "territory_df",
+      "join_key": "territory_cd",
+      "join_type": "left"
+    }
+  ],
+  "column_renames": [],
+  "sql_blocks": []
+}
