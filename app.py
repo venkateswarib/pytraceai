@@ -59,6 +59,25 @@ st.markdown("""
     padding:8px 12px; margin:4px 0; border-radius:0 4px 4px 0;
     font-size:0.88em;
 }
+
+/* Prominent download buttons */
+div[data-testid="stDownloadButton"] button {
+    background: linear-gradient(135deg, #3A86FF 0%, #2563EB 100%) !important;
+    color: white !important;
+    font-weight: 700 !important;
+    font-size: 0.95em !important;
+    padding: 12px 20px !important;
+    border-radius: 8px !important;
+    border: none !important;
+    width: 100% !important;
+    box-shadow: 0 2px 8px rgba(58,134,255,0.4) !important;
+    transition: all 0.2s !important;
+}
+div[data-testid="stDownloadButton"] button:hover {
+    background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
+    box-shadow: 0 4px 14px rgba(58,134,255,0.55) !important;
+    transform: translateY(-1px) !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -137,6 +156,151 @@ def _suggested_action(item: dict) -> str:
     if source == "both_partial":
         return "Minor discrepancy between sources — spot-check recommended."
     return "Review manually and confirm with the pipeline author."
+
+def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
+    """Find script lines that reference the item's key identifier.
+    Returns up to 3 (line_no, stripped_line) tuples."""
+    try:
+        lines = Path(script_path).read_text(encoding="utf-8").splitlines()
+    except Exception:
+        return []
+
+    section = item.get("section", "")
+    if section in ("sources", "targets"):
+        dataset = item.get("dataset", "")
+        candidates = [dataset]
+        if dataset.startswith("jdbc:"):
+            candidates.append(dataset.split("/")[-1])
+        elif "." in dataset:
+            candidates.append(dataset.split(".", 1)[1])
+    elif section == "joins":
+        key = item.get("join_key", "")
+        key_str = (", ".join(key) if isinstance(key, list) else str(key))
+        candidates = [key_str]
+    elif section == "column_renames":
+        candidates = [item.get("old_name", ""), item.get("new_name", "")]
+    else:
+        candidates = []
+
+    seen: set[tuple] = set()
+    hits: list[tuple[int, str]] = []
+    for term in candidates:
+        if not term:
+            continue
+        for i, line in enumerate(lines, 1):
+            stripped = line.strip()
+            if term in stripped and not stripped.startswith("#"):
+                entry = (i, stripped)
+                if entry not in seen:
+                    seen.add(entry)
+                    hits.append(entry)
+                    if len(hits) >= 3:
+                        return hits
+        if hits:
+            break
+    return hits
+
+
+def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
+    """Build a flat lineage mapping table from the merged lineage dict."""
+    rows = []
+    targets  = merged.get("targets", [])
+    tgt_name = targets[0]["dataset"] if targets else Path(script_path).stem
+
+    def _ref_fields(fake_item: dict) -> tuple[str, str]:
+        """Return (line_number_str, code_snippet_str) for a lineage item."""
+        refs = _find_code_refs(script_path, fake_item)
+        if refs:
+            linenos = ", ".join(str(ln) for ln, _ in refs)
+            snippet = " | ".join(s[:80] for _, s in refs)
+            return linenos, snippet
+        src = fake_item.get("source", "both")
+        if src == "llm_only":
+            return "LLM-inferred", "Not a direct code literal — resolved from dynamic pattern"
+        return "", ""
+
+    # 1. Source → target dataset-level rows
+    for src in merged.get("sources", []):
+        for tgt in (targets if targets else [{"dataset": tgt_name}]):
+            nr   = src.get("needs_review", False)
+            fake = {"source": src.get("source", "both"), "section": "sources",
+                    "confidence": src.get("confidence", 1.0), "dataset": src["dataset"]}
+            lineno, snippet = _ref_fields(fake)
+            rows.append({
+                "Source Dataset":   src["dataset"],
+                "Source Column":    "",
+                "Target Dataset":   tgt["dataset"],
+                "Target Column":    "",
+                "Transformation":   src.get("method") or "read",
+                "Confidence":       f"{src.get('confidence', 1.0)*100:.1f}%",
+                "Needs Review":     "Y" if nr else "N",
+                "Suggested Action": _suggested_action(fake) if nr else "",
+                "Line Number":      lineno,
+                "Code Snippet":     snippet,
+            })
+
+    # 2. Join rows
+    for j in merged.get("joins", []):
+        nr      = j.get("needs_review", False)
+        key     = j.get("join_key", "")
+        key_str = ", ".join(key) if isinstance(key, list) else str(key)
+        fake    = {"source": j.get("source", "both"), "section": "joins",
+                   "confidence": j.get("confidence", 1.0), "join_key": key_str}
+        lineno, snippet = _ref_fields(fake)
+        rows.append({
+            "Source Dataset":   j.get("left", ""),
+            "Source Column":    key_str,
+            "Target Dataset":   j.get("right", ""),
+            "Target Column":    key_str,
+            "Transformation":   f"{j.get('join_type','').upper()} JOIN",
+            "Confidence":       f"{j.get('confidence', 1.0)*100:.1f}%",
+            "Needs Review":     "Y" if nr else "N",
+            "Suggested Action": _suggested_action(fake) if nr else "",
+            "Line Number":      lineno,
+            "Code Snippet":     snippet,
+        })
+
+    # 3. Column rename rows — precise column-level lineage
+    for r in merged.get("column_renames", []):
+        nr      = r.get("needs_review", False)
+        reason  = r.get("business_reason", "")
+        fake    = {"source": r.get("source", "both"), "section": "column_renames",
+                   "confidence": r.get("confidence", 1.0), "old_name": r.get("old_name", "")}
+        label   = f"rename — {reason}" if reason else "rename"
+        lineno, snippet = _ref_fields(fake)
+        rows.append({
+            "Source Dataset":   tgt_name,
+            "Source Column":    r.get("old_name", ""),
+            "Target Dataset":   tgt_name,
+            "Target Column":    r.get("new_name", ""),
+            "Transformation":   label,
+            "Confidence":       f"{r.get('confidence', 1.0)*100:.1f}%",
+            "Needs Review":     "Y" if nr else "N",
+            "Suggested Action": _suggested_action(fake) if nr else "",
+            "Line Number":      lineno,
+            "Code Snippet":     snippet,
+        })
+
+    # 4. LLM-inferred transformations (description-level)
+    for t in merged.get("transformations", []):
+        rows.append({
+            "Source Dataset":   tgt_name,
+            "Source Column":    "",
+            "Target Dataset":   tgt_name,
+            "Target Column":    "",
+            "Transformation":   f"{t.get('type','').title()}: {t.get('description','')}",
+            "Confidence":       f"{t.get('confidence', 1.0)*100:.1f}%" if t.get("confidence") else "—",
+            "Needs Review":     "N",
+            "Suggested Action": "",
+            "Line Number":      "",
+            "Code Snippet":     "",
+        })
+
+    cols = ["Source Dataset", "Source Column", "Target Dataset", "Target Column",
+            "Transformation", "Confidence", "Needs Review", "Suggested Action",
+            "Line Number", "Code Snippet"]
+    return pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+
 
 def _merged_path(script_path: str) -> Path:
     return Path(f"outputs/{Path(script_path).stem}_merged.json")
@@ -267,18 +431,8 @@ overall           = merged.get("overall_confidence", 0)
 review_items_list = merged.get("needs_review", [])
 n_review          = len(review_items_list)
 n_src             = len(merged.get("sources", []))
-
-# Session state for review checkboxes — computed before tabs so badge updates live
-script_key = Path(script_path).stem
-if "reviewed_items" not in st.session_state:
-    st.session_state.reviewed_items = set()
-n_unreviewed = sum(
-    1 for i in range(n_review)
-    if f"{script_key}_{i}" not in st.session_state.reviewed_items
-)
-n_tgt = len(merged.get("targets", []))
-n_joins = len(merged.get("joins", []))
-n_renames = len(merged.get("column_renames", []))
+n_tgt             = len(merged.get("targets", []))
+n_joins           = len(merged.get("joins", []))
 
 st.markdown(f"## {Path(script_path).name}")
 
@@ -287,11 +441,43 @@ c1.metric("Overall Confidence",
           f"{overall*100:.1f}%",
           delta="High" if overall >= 0.95 else ("Medium" if overall >= 0.70 else "Needs Review"),
           delta_color="normal" if overall >= 0.70 else "inverse")
-c2.metric("Sources Found",    n_src)
-c3.metric("Targets Found",    n_tgt)
-c4.metric("Joins Detected",   n_joins)
-c5.metric("Needs Review",     n_review,
+c2.metric("Sources Found",  n_src)
+c3.metric("Targets Found",  n_tgt)
+c4.metric("Joins Detected", n_joins)
+c5.metric("Needs Review",   n_review,
           delta_color="inverse" if n_review > 0 else "normal")
+
+st.divider()
+
+# ── Download buttons ──────────────────────────────────────────────────────────
+import json as _json
+from openlineage_emitter import to_openlineage
+
+_ol_event    = to_openlineage(merged, Path(script_path).stem)
+_mapping_df  = _build_lineage_map(merged, script_path)
+_stem        = Path(script_path).stem
+
+dl1, dl2, _ = st.columns([2, 2, 3])
+with dl1:
+    st.download_button(
+        label="⬇  OpenLineage JSON",
+        data=_json.dumps(_ol_event, indent=2),
+        file_name=f"{_stem}_openlineage.json",
+        mime="application/json",
+        use_container_width=True,
+        help="OpenLineage RunEvent — import into Marquez, DataHub, or Atlan",
+        key="dl_ol",
+    )
+with dl2:
+    st.download_button(
+        label="⬇  Lineage Mapping CSV",
+        data=_mapping_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"{_stem}_lineage_mapping.csv",
+        mime="text/csv",
+        use_container_width=True,
+        help="Full source→target mapping with confidence scores and suggested actions",
+        key="dl_map",
+    )
 
 st.divider()
 
@@ -301,7 +487,7 @@ tab_graph, tab_lineage, tab_compare, tab_business, tab_review = st.tabs([
     "🗄  Sources & Targets",
     "⚖  AST vs LLM",
     "💼  Business Context",
-    "✅  All Reviewed" if n_unreviewed == 0 and n_review > 0 else f"⚠  Needs Review ({n_unreviewed})",
+    f"⚠  Needs Review ({n_review})" if n_review > 0 else "✅  Needs Review",
 ])
 
 
@@ -312,18 +498,6 @@ with tab_graph:
         st.image(str(gp), use_container_width=True)
     else:
         st.info("Run extraction to generate the graph.")
-
-    # OpenLineage download
-    import json as _json
-    from openlineage_emitter import to_openlineage
-    ol_event = to_openlineage(merged, Path(script_path).stem)
-    st.download_button(
-        label="⬇ Download OpenLineage JSON",
-        data=_json.dumps(ol_event, indent=2),
-        file_name=f"{Path(script_path).stem}_openlineage.json",
-        mime="application/json",
-        help="OpenLineage-compliant RunEvent — import into Marquez, DataHub, or Atlan",
-    )
 
     with st.expander("Join details", expanded=True):
         joins = merged.get("joins", [])
@@ -563,10 +737,9 @@ with tab_review:
     if not review_items_list:
         st.success("All items verified by both AST and LLM. Nothing needs review.", icon="✅")
     else:
-        reviewed_count = n_review - n_unreviewed
-        st.progress(
-            reviewed_count / n_review,
-            text=f"{reviewed_count} of {n_review} items resolved",
+        st.caption(
+            f"{n_review} item(s) flagged. Download the **Lineage Mapping CSV** above "
+            "for the full list with suggested actions."
         )
 
         blocks       = [(i, it) for i, it in enumerate(review_items_list) if _severity(it) == "block"]
@@ -577,10 +750,7 @@ with tab_review:
             if not tier_items:
                 return
             st.markdown(f"#### {icon} {label} — {len(tier_items)} item(s)")
-            for idx, item in tier_items:
-                item_key = f"{script_key}_{idx}"
-                is_done  = item_key in st.session_state.reviewed_items
-
+            for _, item in tier_items:
                 section = item.get("section", "?")
                 dataset = (
                     item.get("dataset")
@@ -589,44 +759,38 @@ with tab_review:
                 )
                 conf   = item.get("confidence", 0)
                 source = item.get("source", "?")
-                desc   = (
-                    item.get("description")
-                    or item.get("business_reason")
-                    or ""
-                )
+                desc   = item.get("description") or item.get("business_reason") or ""
                 action = _suggested_action(item)
+                refs   = _find_code_refs(script_path, item)
 
                 with st.container(border=True):
-                    col_cb, col_body = st.columns([0.5, 9.5])
-
-                    with col_cb:
-                        checked = st.checkbox(
-                            "Done", value=is_done,
-                            key=f"cb_{item_key}",
-                            label_visibility="collapsed",
+                    r1, r2 = st.columns([5, 1])
+                    r1.markdown(
+                        f"**[{section.upper()}]** `{dataset}`  {_source_html(source)}",
+                        unsafe_allow_html=True,
+                    )
+                    r2.markdown(_conf_html(conf), unsafe_allow_html=True)
+                    st.markdown(
+                        f"<div style='background:#EFF6FF;border-left:3px solid #3A86FF;"
+                        f"padding:6px 10px;border-radius:0 4px 4px 0;font-size:0.85em;margin:4px 0'>"
+                        f"<strong>Suggested action:</strong> {action}</div>",
+                        unsafe_allow_html=True,
+                    )
+                    if refs:
+                        for lineno, line_text in refs:
+                            st.markdown(
+                                f"<span style='font-size:0.75em;color:#636E72;font-family:monospace'>"
+                                f"📍 Line {lineno}</span>",
+                                unsafe_allow_html=True,
+                            )
+                            st.code(line_text, language="python")
+                    else:
+                        st.caption(
+                            "⚡ LLM-inferred — not a direct string literal in code "
+                            "(resolved from dynamic pattern, config dict, or helper function)"
                         )
-                        if checked:
-                            st.session_state.reviewed_items.add(item_key)
-                        else:
-                            st.session_state.reviewed_items.discard(item_key)
-
-                    with col_body:
-                        r1, r2 = st.columns([5, 1])
-                        r1.markdown(
-                            f"**[{section.upper()}]** `{dataset}`  "
-                            f"{_source_html(source)}",
-                            unsafe_allow_html=True,
-                        )
-                        r2.markdown(_conf_html(conf), unsafe_allow_html=True)
-
-                        st.markdown(
-                            f"<div style='background:#EFF6FF;border-left:3px solid #3A86FF;"
-                            f"padding:6px 10px;border-radius:0 4px 4px 0;font-size:0.85em;margin:4px 0'>"
-                            f"<strong>Suggested action:</strong> {action}</div>",
-                            unsafe_allow_html=True,
-                        )
-                        if desc:
-                            st.caption(desc[:120] + "..." if len(desc) > 120 else desc)
+                    if desc:
+                        st.caption(desc[:120] + "..." if len(desc) > 120 else desc)
 
         _render_tier(blocks,       "🔴", "Block — resolve before production")
         _render_tier(investigates, "🟡", "Investigate — verify with data owner")
