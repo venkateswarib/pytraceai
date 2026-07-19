@@ -1,11 +1,5 @@
-pyspark>=3.5.0
 streamlit>=1.35.0
 pandas>=2.0.0
 openai>=1.30.0
-openlineage-python>=1.9.0
 networkx>=3.2
 matplotlib>=3.8
-graphviz>=0.20
-streamlit>=1.35.0
-openai>=1.30.0
-astor>=0.8.1
