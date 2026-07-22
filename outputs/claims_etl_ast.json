@@ -62,5 +62,6 @@
     }
   ],
   "sql_blocks": [],
-  "opaque_logic": []
+  "opaque_logic": [],
+  "agg_aliases": []
 }

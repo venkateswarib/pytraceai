@@ -232,11 +232,13 @@ def _merge_joins(ast_joins: list[dict], llm_joins: list[dict]) -> list[dict]:
     return out
 
 
-def _merge_renames(ast_renames: list[dict], llm_renames: list[dict]) -> list[dict]:
+def _merge_renames(ast_renames: list[dict], llm_renames: list[dict],
+                    agg_aliases: list[str] | None = None) -> list[dict]:
     """
     Match renames by (old_name, new_name) pair.
     AST is structurally exact; LLM adds business_reason.
     """
+    agg_alias_set = {_norm(a) for a in (agg_aliases or [])}
     llm_exact  = {(_norm(r["old_name"]), _norm(r["new_name"])): r
                   for r in llm_renames if r.get("old_name") and r.get("new_name")}
     llm_by_old = {_norm(r["old_name"]): r
@@ -284,12 +286,16 @@ def _merge_renames(ast_renames: list[dict], llm_renames: list[dict]) -> list[dic
                 "needs_review":   False,
             })
 
-    # LLM-only renames — skip aggregation expressions misidentified as renames
+    # LLM-only renames — skip aggregation expressions misidentified as renames.
+    # Checked two ways: the LLM sometimes phrases old_name as the raw
+    # aggregation-call text (regex), and sometimes as a bare column name —
+    # the ast-verified agg_aliases set catches that second case regardless
+    # of phrasing, since it's keyed on the (ground-truth) new column name.
     _AGG = re.compile(r"^(sum|avg|count|min|max|first|last|collect_list|collect_set)\s*\(", re.I)
     for r in llm_renames:
         pair = (_norm(r.get("old_name", "")), _norm(r.get("new_name", "")))
         if pair not in used_llm and r.get("old_name") and r.get("new_name"):
-            if _AGG.match(r["old_name"]):
+            if _AGG.match(r["old_name"]) or _norm(r["new_name"]) in agg_alias_set:
                 continue  # .agg().alias() is not a rename
             out.append({
                 "old_name":       r["old_name"],
@@ -343,7 +349,8 @@ def extract_lineage(script: str, model: str = "anthropic/claude-sonnet-4-5") -> 
         "sources":        _merge_datasets(dict_a["sources"],        dict_b.get("sources",        [])),
         "targets":        _merge_datasets(dict_a["targets"],        dict_b.get("targets",        [])),
         "joins":          _merge_joins(   dict_a["joins"],          dict_b.get("joins",          [])),
-        "column_renames": _merge_renames( dict_a["column_renames"], dict_b.get("column_renames", [])),
+        "column_renames": _merge_renames( dict_a["column_renames"], dict_b.get("column_renames", []),
+                                           dict_a.get("agg_aliases", [])),
         # sql_blocks: union, dedup by content
         "sql_blocks":     list({s for s in (dict_a["sql_blocks"] + dict_b.get("sql_blocks", []))
                                 if s and s.strip()}),

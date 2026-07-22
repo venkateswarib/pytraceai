@@ -31,5 +31,12 @@
   ],
   "column_renames": [],
   "sql_blocks": [],
-  "opaque_logic": []
+  "opaque_logic": [],
+  "agg_aliases": [
+    "total_endorsement_premium",
+    "total_earned_premium",
+    "avg_earned_premium",
+    "policy_count",
+    "total_written_premium"
+  ]
 }

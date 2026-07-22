@@ -321,16 +321,6 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
     return hits
 
 
-def _item_key(item: dict, section: str) -> str:
-    """Normalised key so an AST finding and an LLM finding for the same
-    real-world thing land on the same comparison row."""
-    if section == "joins":
-        key = item.get("join_key", "")
-        key_str = ", ".join(key) if isinstance(key, list) else str(key)
-        return f"{item.get('left','')}|{item.get('right','')}|{key_str}".strip().lower()
-    return str(item.get("dataset", "")).strip().lower()
-
-
 def _item_label(item: dict, section: str) -> str:
     if section == "joins":
         key = item.get("join_key", "?")
@@ -349,77 +339,73 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
     AST's column can only name the bare node type, LLM's column has the
     actual decoded meaning. Seeing all three side by side per row is what
     makes the blind spot visible, without a separate explanatory section.
-    """
-    def _dedupe_llm_subkey_joins(ast_joins: list[dict], llm_joins: list[dict]) -> list[dict]:
-        """Drop an LLM join entry when it's just one component of an AST
-        multi-key join between the same table pair — the LLM sometimes
-        splits on=['a','b'] into two separate single-key hallucinated joins,
-        which would otherwise show up as noisy near-duplicate rows."""
-        multi_keys = [
-            (str(a.get("left", "")).strip().lower(), str(a.get("right", "")).strip().lower(),
-             [str(k).strip().lower() for k in a["join_key"]])
-            for a in ast_joins if isinstance(a.get("join_key"), list)
-        ]
-        out = []
-        for l in llm_joins:
-            l_left  = str(l.get("left", "")).strip().lower()
-            l_right = str(l.get("right", "")).strip().lower()
-            l_key   = str(l.get("join_key", "")).strip().lower()
-            is_subkey = any(
-                (m_left in l_left or l_left in m_left) and
-                (m_right in l_right or l_right in m_right) and
-                l_key in m_keys
-                for m_left, m_right, m_keys in multi_keys
-            )
-            if not is_subkey:
-                out.append(l)
-        return out
 
+    Rows are built from the already-merged (post-scoring) data, not
+    re-derived from raw ast_raw/llm_raw — extractor.py's merge already
+    resolves multi-key vs. split-key join phrasing, sub-key dedup, and
+    confidence/needs_review. Re-matching independently here (an earlier
+    version of this function did) could disagree with the merge's own
+    verdict — e.g. treating an LLM join the merge correctly matched as
+    unmatched, because its raw join_key shape didn't equal the AST one.
+    """
     rows: list[dict] = []
 
-    def add_section(section: str, ast_items: list[dict], llm_items: list[dict]):
-        if section == "joins":
-            llm_items = _dedupe_llm_subkey_joins(ast_items, llm_items)
-        ast_map = {_item_key(i, section): i for i in ast_items}
-        llm_map = {_item_key(i, section): i for i in llm_items}
-        for k in dict.fromkeys(list(ast_map) + list(llm_map)):
-            a, l = ast_map.get(k), llm_map.get(k)
-            basis = a or l
-            label = _item_label(basis, section)
-
-            if section == "joins":
-                fake = {"section": "joins", "join_key": basis.get("join_key", ""),
-                        "left": basis.get("left", ""), "right": basis.get("right", "")}
+    def add_merged_section(section: str, items: list[dict]):
+        for item in items:
+            src = item.get("source", "both")
+            if section == "column_renames":
+                label = f"{item.get('old_name','?')} → {item.get('new_name','?')}"
+                fake = {"section": "column_renames",
+                        "old_name": item.get("old_name", ""), "new_name": item.get("new_name", "")}
+            elif section == "joins":
+                label = _item_label(item, "joins")
+                fake = {"section": "joins", "join_key": item.get("join_key", ""),
+                        "left": item.get("left", ""), "right": item.get("right", "")}
             else:
-                fake = {"section": section, "dataset": basis.get("dataset", "")}
+                label = _item_label(item, section)
+                fake = {"section": section, "dataset": item.get("dataset", "")}
+
             refs = _find_code_refs(script_path, fake)
             line, snippet = (refs[0][0], refs[0][1]) if refs else (None, "—")
 
-            ast_cell = label if a else "🚫 not found"
-            llm_cell = (l.get("description") or label) if l else "—"
-            rows.append({"line": line, "snippet": snippet, "ast": ast_cell, "llm": llm_cell})
+            ast_cell = label if src in ("both", "ast_only", "both_partial") else "🚫 not found"
+            if src in ("both", "llm_only", "both_partial"):
+                desc = item.get("description") or item.get("business_reason") or ""
+                llm_cell = f"{label} — {desc}" if desc else label
+            else:
+                llm_cell = "—"
 
-    add_section("sources", ast_raw.get("sources", []), llm_raw.get("sources", []))
-    add_section("targets", ast_raw.get("targets", []), llm_raw.get("targets", []))
-    add_section("joins",   ast_raw.get("joins",   []), llm_raw.get("joins",   []))
+            rows.append({
+                "line": line, "snippet": snippet, "ast": ast_cell, "llm": llm_cell,
+                "confidence": f"{item.get('confidence', 1.0) * 100:.0f}%",
+                "review": "⚠️ Y" if item.get("needs_review") else "✅ N",
+            })
+
+    add_merged_section("sources",        merged.get("sources", []))
+    add_merged_section("targets",        merged.get("targets", []))
+    add_merged_section("joins",          merged.get("joins", []))
+    add_merged_section("column_renames", merged.get("column_renames", []))
 
     derived = [t for t in merged.get("transformations", []) if t.get("type") == "derive"]
     for i, o in enumerate(ast_raw.get("opaque_logic", [])):
         d = derived[i] if i < len(derived) else None
         rows.append({
-            "line":    o.get("line"),
-            "snippet": f'{o["variable"]} = "{o["raw_preview"]}"',
-            "ast":     f'⚠️ {o["ast_node"]} — opaque, cannot execute or decode',
-            "llm":     d["description"] if d else "Run/re-run extraction to decode this payload.",
+            "line":       o.get("line"),
+            "snippet":    f'{o["variable"]} = "{o["raw_preview"]}"',
+            "ast":        f'⚠️ {o["ast_node"]} — opaque, cannot execute or decode',
+            "llm":        d["description"] if d else "Run/re-run extraction to decode this payload.",
+            "confidence": "60%" if d else "—",
+            "review":     "⚠️ Y",
         })
 
     rows.sort(key=lambda r: (r["line"] is None, r["line"] or 0))
+    cols = ["Line", "Code", "AST Found", "LLM Found", "Confidence", "Needs Review"]
     return pd.DataFrame([
-        {"Line": r["line"] or "—", "Code": r["snippet"], "AST Found": r["ast"], "LLM Found": r["llm"]}
+        {"Line": (str(r["line"]) if r["line"] is not None else "—"), "Code": r["snippet"],
+         "AST Found": r["ast"], "LLM Found": r["llm"],
+         "Confidence": r["confidence"], "Needs Review": r["review"]}
         for r in rows
-    ]) if rows else pd.DataFrame(columns=["Line", "Code", "AST Found", "LLM Found"])
-
-    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Finding", "AST", "LLM"])
+    ], columns=cols) if rows else pd.DataFrame(columns=cols)
 
 
 def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
@@ -831,10 +817,12 @@ with tab_compare:
             st.dataframe(
                 df, use_container_width=True, hide_index=True,
                 column_config={
-                    "Line":      st.column_config.TextColumn(width="small"),
-                    "Code":      st.column_config.TextColumn(width="large"),
-                    "AST Found": st.column_config.TextColumn(width="medium"),
-                    "LLM Found": st.column_config.TextColumn(width="large"),
+                    "Line":         st.column_config.TextColumn(width="small"),
+                    "Code":         st.column_config.TextColumn(width="large"),
+                    "AST Found":    st.column_config.TextColumn(width="medium"),
+                    "LLM Found":    st.column_config.TextColumn(width="large"),
+                    "Confidence":   st.column_config.TextColumn(width="small"),
+                    "Needs Review": st.column_config.TextColumn(width="small"),
                 },
             )
     elif ast_raw:

@@ -44,6 +44,7 @@ def parse_script(source_code: str) -> dict:
         "column_renames": list(reversed(visitor.column_renames)),
         "sql_blocks":     visitor.sql_blocks,
         "opaque_logic":   _find_opaque_logic(tree, constants),
+        "agg_aliases":    _find_agg_aliases(tree),
     }
 
 
@@ -250,6 +251,39 @@ def _try_resolve_fstring(node: ast.JoinedStr, constants: dict[str, str]) -> str 
         else:
             return None
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Aggregation-alias detection
+# ---------------------------------------------------------------------------
+
+_AGG_FUNCS = {"sum", "avg", "count", "min", "max",
+              "first", "last", "collect_list", "collect_set"}
+
+
+def _find_agg_aliases(tree: ast.Module) -> list[str]:
+    """
+    Detect .alias("x") calls chained directly onto an aggregation function,
+    e.g. F.sum("endorsement_premium").alias("total_endorsement_premium").
+    This creates a brand-new column — it is not a rename of an existing one.
+    An LLM sometimes still reports it as a rename (phrasing the "old name"
+    either as the raw column or as the full aggregation-call text); checking
+    the ast-verified new-column name here catches the hallucination
+    regardless of how the LLM phrases the old side.
+    """
+    aliases: list[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "alias"):
+            continue
+        receiver = node.func.value
+        if isinstance(receiver, ast.Call):
+            rchain = _get_attr_chain(receiver)
+            if rchain and rchain[-1] in _AGG_FUNCS:
+                name = _first_string_arg(node)
+                if name:
+                    aliases.append(name)
+    return aliases
 
 
 # ---------------------------------------------------------------------------
