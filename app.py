@@ -5,9 +5,12 @@ Streamlit demo application for AI-powered PySpark lineage extraction.
 Run with:  streamlit run app.py
 """
 
+import functools
+import io
 import json
 import os
 import sys
+import tokenize
 from pathlib import Path
 
 import pandas as pd
@@ -60,35 +63,47 @@ st.markdown("""
     font-size:0.88em;
 }
 
-/* ── Hero banner ── */
+/* ── Hero banner (sidebar) ── */
 .pytraceai-hero {
     background: linear-gradient(135deg, #0F172A 0%, #1E3A5F 60%, #2563EB 100%);
-    border-radius: 12px;
-    padding: 28px 36px 22px 36px;
-    margin-bottom: 24px;
+    border-radius: 10px;
+    padding: 16px 16px 14px 16px;
+    margin-bottom: 4px;
 }
 .pytraceai-hero h1 {
-    margin: 0 0 4px 0;
-    font-size: 2.4em;
+    margin: 0 0 2px 0;
+    font-size: 1.5em;
     font-weight: 800;
     letter-spacing: -0.02em;
     color: #FFFFFF;
 }
 .pytraceai-hero .sub {
-    font-size: 1.05em;
+    font-size: 0.8em;
     color: #93C5FD;
     margin: 0;
+    line-height: 1.35;
 }
 .pytraceai-hero .tagline {
     display: inline-block;
-    margin-top: 10px;
+    margin-top: 8px;
     background: rgba(255,255,255,0.12);
     border: 1px solid rgba(255,255,255,0.2);
-    border-radius: 20px;
-    padding: 4px 14px;
-    font-size: 0.78em;
+    border-radius: 14px;
+    padding: 3px 10px;
+    font-size: 0.64em;
     color: #BFDBFE;
-    letter-spacing: 0.06em;
+    letter-spacing: 0.03em;
+}
+
+/* ── Line-reference chips (AST vs LLM tab) ── */
+.line-ref {
+    font-size: 0.72em; color: #636E72; font-family: monospace;
+    margin: 6px 0 2px 0; display: block;
+}
+.no-line-ref {
+    font-size: 0.8em; color: #9B59B6; background: #F7F0FB;
+    border-left: 3px solid #9B59B6; padding: 4px 8px; border-radius: 0 4px 4px 0;
+    margin: 4px 0 10px 0;
 }
 
 /* Prominent download buttons */
@@ -194,6 +209,62 @@ def _suggested_action(item: dict) -> str:
         return "Minor discrepancy between sources — spot-check recommended."
     return "Review manually and confirm with the pipeline author."
 
+@functools.lru_cache(maxsize=8)
+def _docstring_lines(script_path: str) -> frozenset[int]:
+    """Line numbers that fall inside a multi-line string literal (module/
+    function docstrings). Excluded from code-reference search — prose in a
+    docstring can coincidentally contain a search term (e.g. a column name
+    mentioned in a comment) and must not be mistaken for the real code line."""
+    try:
+        source = Path(script_path).read_text(encoding="utf-8")
+    except Exception:
+        return frozenset()
+    lines: set[int] = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+            if tok.type == tokenize.STRING and tok.start[0] != tok.end[0]:
+                lines.update(range(tok.start[0], tok.end[0] + 1))
+    except (tokenize.TokenError, SyntaxError, IndentationError):
+        pass
+    return frozenset(lines)
+
+
+def _find_join_ref(
+    lines: list[str], docstring_lines: frozenset[int],
+    key_list: list[str], left_name: str, right_name: str,
+) -> list[tuple[int, str]]:
+    """Locate the specific .join(...) call this item describes, then return
+    its 'on=' clause line. A plain substring search on the join key alone is
+    unreliable — the same column name often also appears in an unrelated SQL
+    string or config dict elsewhere in the script (e.g. a JDBC query that
+    selects the same columns). Anchoring on the nearest '.join(' call site
+    and scoring candidate blocks by how many of {left df, right df, key(s)}
+    they contain disambiguates the real join from a coincidental text match."""
+    call_lines = [i for i, line in enumerate(lines, 1)
+                  if i not in docstring_lines and ".join(" in line]
+    best_block, best_score = None, 0
+    for start in call_lines:
+        end = min(start + 7, len(lines))
+        block_text = " ".join(lines[start - 1:end])
+        score = sum([
+            bool(left_name) and left_name in block_text,
+            bool(right_name) and right_name in block_text,
+        ]) + sum(1 for k in key_list if k and k in block_text)
+        if score > best_score:
+            best_score, best_block = score, (start, end)
+    if best_block is None:
+        return []
+    start, end = best_block
+    for i in range(start, end + 1):
+        if i in docstring_lines:
+            continue
+        stripped = lines[i - 1].strip()
+        if "on=" in stripped or "on ==" in stripped or "on =" in stripped \
+                or any(k and k in stripped for k in key_list):
+            return [(i, stripped)]
+    return [(start, lines[start - 1].strip())]
+
+
 def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
     """Find script lines that reference the item's key identifier.
     Returns up to 3 (line_no, stripped_line) tuples."""
@@ -201,6 +272,7 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
         lines = Path(script_path).read_text(encoding="utf-8").splitlines()
     except Exception:
         return []
+    docstring_lines = _docstring_lines(script_path)
 
     section = item.get("section", "")
     if section in ("sources", "targets"):
@@ -212,8 +284,11 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
             candidates.append(dataset.split(".", 1)[1])
     elif section == "joins":
         key = item.get("join_key", "")
-        key_str = (", ".join(key) if isinstance(key, list) else str(key))
-        candidates = [key_str]
+        key_list = key if isinstance(key, list) else ([key] if key else [])
+        return _find_join_ref(
+            lines, docstring_lines, key_list,
+            item.get("left", ""), item.get("right", ""),
+        )
     elif section == "column_renames":
         candidates = [item.get("old_name", ""), item.get("new_name", "")]
     else:
@@ -225,6 +300,8 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
         if not term:
             continue
         for i, line in enumerate(lines, 1):
+            if i in docstring_lines:
+                continue
             stripped = line.strip()
             if term in stripped and not stripped.startswith("#"):
                 entry = (i, stripped)
@@ -236,6 +313,36 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
         if hits:
             break
     return hits
+
+
+def _render_item_with_lines(script_path: str, item: dict, section: str) -> None:
+    """Render a raw AST/LLM finding as a code chip, with its exact source
+    line highlighted underneath — or a callout if no literal line exists
+    (i.e. the value was resolved from a dynamic/encoded pattern)."""
+    if section == "joins":
+        key = item.get("join_key", "?")
+        key_str = ", ".join(key) if isinstance(key, list) else str(key)
+        label = f"{item.get('left','?')} x {item.get('right','?')} ON {key_str} ({item.get('join_type','?')})"
+        fake = {"section": "joins", "join_key": item.get("join_key", ""),
+                "left": item.get("left", ""), "right": item.get("right", "")}
+    else:
+        label = item.get("dataset", "?")
+        fake = {"section": section, "dataset": label}
+
+    st.code(label, language=None)
+    refs = _find_code_refs(script_path, fake)
+    if refs:
+        lineno, snippet = refs[0]
+        st.markdown(f'<span class="line-ref">📍 Line {lineno}</span>', unsafe_allow_html=True)
+        st.code(snippet, language="python")
+    else:
+        st.markdown(
+            '<div class="no-line-ref">⚡ No literal line match — resolved from a '
+            'dynamic/encoded pattern, not visible as plain text in source</div>',
+            unsafe_allow_html=True,
+        )
+    if item.get("description"):
+        st.caption(item["description"])
 
 
 def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
@@ -282,7 +389,8 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
         key     = j.get("join_key", "")
         key_str = ", ".join(key) if isinstance(key, list) else str(key)
         fake    = {"source": j.get("source", "both"), "section": "joins",
-                   "confidence": j.get("confidence", 1.0), "join_key": key_str}
+                   "confidence": j.get("confidence", 1.0), "join_key": key,
+                   "left": j.get("left", ""), "right": j.get("right", "")}
         lineno, snippet = _ref_fields(fake)
         rows.append({
             "Source Dataset":   j.get("left", ""),
@@ -357,8 +465,13 @@ def _load_json(p: Path) -> dict | None:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("### 🔍 PyTraceAi")
-    st.caption("Select a script · Run Extraction · Download lineage")
+    st.markdown("""
+<div class="pytraceai-hero">
+  <h1>🔍 PyTraceAi</h1>
+  <p class="sub">AI-powered PySpark lineage extraction</p>
+  <span class="tagline">AST · LLM · Confidence</span>
+</div>
+""", unsafe_allow_html=True)
     st.divider()
 
     selected_name = st.selectbox(
@@ -444,14 +557,6 @@ if run_btn:
 merged = _load_json(_merged_path(script_path))
 ast_raw = _load_json(_ast_path(script_path))
 llm_raw = _load_json(_llm_path(script_path))
-
-st.markdown("""
-<div class="pytraceai-hero">
-  <h1>🔍 PyTraceAi</h1>
-  <p class="sub">AI-powered PySpark data lineage extraction</p>
-  <span class="tagline">AST  ·  LLM  ·  Confidence scoring  ·  OpenLineage</span>
-</div>
-""", unsafe_allow_html=True)
 
 if merged is None:
     st.markdown("""
@@ -630,7 +735,10 @@ with tab_lineage:
 
 # ── Tab 3: AST vs LLM ────────────────────────────────────────────────────────
 with tab_compare:
-    st.caption("Side-by-side comparison of what each source found independently.")
+    st.caption(
+        "Side-by-side comparison of what each source found independently — "
+        "with the exact source line highlighted underneath, when one exists."
+    )
 
     col_ast, col_llm = st.columns(2)
 
@@ -650,24 +758,21 @@ with tab_compare:
             st.markdown("**Sources:**")
             if ast_raw.get("sources"):
                 for s in ast_raw["sources"]:
-                    st.code(s["dataset"], language=None)
+                    _render_item_with_lines(script_path, s, "sources")
             else:
                 st.warning("No sources found by AST.", icon="⚠️")
 
             st.markdown("**Targets:**")
             if ast_raw.get("targets"):
                 for t in ast_raw["targets"]:
-                    st.code(t["dataset"], language=None)
+                    _render_item_with_lines(script_path, t, "targets")
             else:
                 st.warning("No targets found by AST.", icon="⚠️")
 
             st.markdown("**Joins:**")
             if ast_raw.get("joins"):
                 for j in ast_raw["joins"]:
-                    key = j.get("join_key","?")
-                    key_str = ", ".join(key) if isinstance(key, list) else str(key)
-                    st.code(f"{j['left']} x {j['right']} ON {key_str} ({j['join_type']})",
-                            language=None)
+                    _render_item_with_lines(script_path, j, "joins")
             else:
                 st.warning("No joins found by AST.", icon="⚠️")
 
@@ -693,24 +798,15 @@ with tab_compare:
 
             st.markdown("**Sources:**")
             for s in llm_raw.get("sources", []):
-                st.code(s["dataset"], language=None)
-                if s.get("description"):
-                    st.caption(s["description"])
+                _render_item_with_lines(script_path, s, "sources")
 
             st.markdown("**Targets:**")
             for t in llm_raw.get("targets", []):
-                st.code(t["dataset"], language=None)
-                if t.get("description"):
-                    st.caption(t["description"])
+                _render_item_with_lines(script_path, t, "targets")
 
             st.markdown("**Joins:**")
             for j in llm_raw.get("joins", []):
-                key = j.get("join_key","?")
-                key_str = ", ".join(key) if isinstance(key, list) else str(key)
-                st.code(f"{j['left']} x {j['right']} ON {key_str} ({j['join_type']})",
-                        language=None)
-                if j.get("description"):
-                    st.caption(j["description"])
+                _render_item_with_lines(script_path, j, "joins")
         else:
             st.info("Run extraction to see LLM output.")
 
