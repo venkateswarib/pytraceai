@@ -95,16 +95,6 @@ st.markdown("""
     letter-spacing: 0.03em;
 }
 
-/* ── Line-reference chips (AST vs LLM tab) ── */
-.line-ref {
-    font-size: 0.72em; color: #636E72; font-family: monospace;
-    margin: 6px 0 2px 0; display: block;
-}
-.no-line-ref {
-    font-size: 0.8em; color: #9B59B6; background: #F7F0FB;
-    border-left: 3px solid #9B59B6; padding: 4px 8px; border-radius: 0 4px 4px 0;
-    margin: 4px 0 10px 0;
-}
 
 /* Prominent download buttons */
 div[data-testid="stDownloadButton"] button {
@@ -242,14 +232,30 @@ def _find_join_ref(
     they contain disambiguates the real join from a coincidental text match."""
     call_lines = [i for i, line in enumerate(lines, 1)
                   if i not in docstring_lines and ".join(" in line]
-    best_block, best_score = None, 0
-    for start in call_lines:
+
+    def _is_exact_receiver(line: str) -> bool:
+        """True if `left_name` is literally the receiver right before
+        '.join(' on this line — e.g. 'rated_df.join(' or
+        'x = rated_df.join('. Two different .join() calls can share the
+        same left/right/key text somewhere in their block (e.g. one call's
+        assignment target is another call's receiver name); this is the
+        one unambiguous signal that picks the correct call site."""
+        idx = line.find(".join(")
+        return bool(left_name) and idx != -1 and line[:idx].rstrip().endswith(left_name)
+
+    exact_calls = [i for i in call_lines if _is_exact_receiver(lines[i - 1])]
+    candidate_starts = exact_calls or call_lines
+
+    best_block, best_score = None, -1
+    for start in candidate_starts:
         end = min(start + 7, len(lines))
         block_text = " ".join(lines[start - 1:end])
         score = sum([
             bool(left_name) and left_name in block_text,
             bool(right_name) and right_name in block_text,
         ]) + sum(1 for k in key_list if k and k in block_text)
+        if start in exact_calls:
+            score += 10  # exact receiver match beats any coincidental overlap
         if score > best_score:
             best_score, best_block = score, (start, end)
     if best_block is None:
@@ -315,34 +321,105 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
     return hits
 
 
-def _render_item_with_lines(script_path: str, item: dict, section: str) -> None:
-    """Render a raw AST/LLM finding as a code chip, with its exact source
-    line highlighted underneath — or a callout if no literal line exists
-    (i.e. the value was resolved from a dynamic/encoded pattern)."""
+def _item_key(item: dict, section: str) -> str:
+    """Normalised key so an AST finding and an LLM finding for the same
+    real-world thing land on the same comparison row."""
+    if section == "joins":
+        key = item.get("join_key", "")
+        key_str = ", ".join(key) if isinstance(key, list) else str(key)
+        return f"{item.get('left','')}|{item.get('right','')}|{key_str}".strip().lower()
+    return str(item.get("dataset", "")).strip().lower()
+
+
+def _item_label(item: dict, section: str) -> str:
     if section == "joins":
         key = item.get("join_key", "?")
         key_str = ", ".join(key) if isinstance(key, list) else str(key)
-        label = f"{item.get('left','?')} x {item.get('right','?')} ON {key_str} ({item.get('join_type','?')})"
-        fake = {"section": "joins", "join_key": item.get("join_key", ""),
-                "left": item.get("left", ""), "right": item.get("right", "")}
-    else:
-        label = item.get("dataset", "?")
-        fake = {"section": section, "dataset": label}
+        return f"{item.get('left','?')} ⋈ {item.get('right','?')}  on {key_str}"
+    return item.get("dataset", "?")
 
-    st.code(label, language=None)
-    refs = _find_code_refs(script_path, fake)
-    if refs:
-        lineno, snippet = refs[0]
-        st.markdown(f'<span class="line-ref">📍 Line {lineno}</span>', unsafe_allow_html=True)
-        st.code(snippet, language="python")
-    else:
-        st.markdown(
-            '<div class="no-line-ref">⚡ No literal line match — resolved from a '
-            'dynamic/encoded pattern, not visible as plain text in source</div>',
-            unsafe_allow_html=True,
-        )
-    if item.get("description"):
-        st.caption(item["description"])
+
+def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: dict) -> pd.DataFrame:
+    """
+    One row per finding, ordered by source line — Code | AST Found | LLM Found.
+    A single table instead of separate per-section grids plus a bolted-on
+    'hidden logic' box: the code snippet itself carries the story. For a
+    plain literal, the snippet is the read/write/join call and both columns
+    agree. For an encoded payload, the snippet IS the opaque base64 blob —
+    AST's column can only name the bare node type, LLM's column has the
+    actual decoded meaning. Seeing all three side by side per row is what
+    makes the blind spot visible, without a separate explanatory section.
+    """
+    def _dedupe_llm_subkey_joins(ast_joins: list[dict], llm_joins: list[dict]) -> list[dict]:
+        """Drop an LLM join entry when it's just one component of an AST
+        multi-key join between the same table pair — the LLM sometimes
+        splits on=['a','b'] into two separate single-key hallucinated joins,
+        which would otherwise show up as noisy near-duplicate rows."""
+        multi_keys = [
+            (str(a.get("left", "")).strip().lower(), str(a.get("right", "")).strip().lower(),
+             [str(k).strip().lower() for k in a["join_key"]])
+            for a in ast_joins if isinstance(a.get("join_key"), list)
+        ]
+        out = []
+        for l in llm_joins:
+            l_left  = str(l.get("left", "")).strip().lower()
+            l_right = str(l.get("right", "")).strip().lower()
+            l_key   = str(l.get("join_key", "")).strip().lower()
+            is_subkey = any(
+                (m_left in l_left or l_left in m_left) and
+                (m_right in l_right or l_right in m_right) and
+                l_key in m_keys
+                for m_left, m_right, m_keys in multi_keys
+            )
+            if not is_subkey:
+                out.append(l)
+        return out
+
+    rows: list[dict] = []
+
+    def add_section(section: str, ast_items: list[dict], llm_items: list[dict]):
+        if section == "joins":
+            llm_items = _dedupe_llm_subkey_joins(ast_items, llm_items)
+        ast_map = {_item_key(i, section): i for i in ast_items}
+        llm_map = {_item_key(i, section): i for i in llm_items}
+        for k in dict.fromkeys(list(ast_map) + list(llm_map)):
+            a, l = ast_map.get(k), llm_map.get(k)
+            basis = a or l
+            label = _item_label(basis, section)
+
+            if section == "joins":
+                fake = {"section": "joins", "join_key": basis.get("join_key", ""),
+                        "left": basis.get("left", ""), "right": basis.get("right", "")}
+            else:
+                fake = {"section": section, "dataset": basis.get("dataset", "")}
+            refs = _find_code_refs(script_path, fake)
+            line, snippet = (refs[0][0], refs[0][1]) if refs else (None, "—")
+
+            ast_cell = label if a else "🚫 not found"
+            llm_cell = (l.get("description") or label) if l else "—"
+            rows.append({"line": line, "snippet": snippet, "ast": ast_cell, "llm": llm_cell})
+
+    add_section("sources", ast_raw.get("sources", []), llm_raw.get("sources", []))
+    add_section("targets", ast_raw.get("targets", []), llm_raw.get("targets", []))
+    add_section("joins",   ast_raw.get("joins",   []), llm_raw.get("joins",   []))
+
+    derived = [t for t in merged.get("transformations", []) if t.get("type") == "derive"]
+    for i, o in enumerate(ast_raw.get("opaque_logic", [])):
+        d = derived[i] if i < len(derived) else None
+        rows.append({
+            "line":    o.get("line"),
+            "snippet": f'{o["variable"]} = "{o["raw_preview"]}"',
+            "ast":     f'⚠️ {o["ast_node"]} — opaque, cannot execute or decode',
+            "llm":     d["description"] if d else "Run/re-run extraction to decode this payload.",
+        })
+
+    rows.sort(key=lambda r: (r["line"] is None, r["line"] or 0))
+    return pd.DataFrame([
+        {"Line": r["line"] or "—", "Code": r["snippet"], "AST Found": r["ast"], "LLM Found": r["llm"]}
+        for r in rows
+    ]) if rows else pd.DataFrame(columns=["Line", "Code", "AST Found", "LLM Found"])
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Finding", "AST", "LLM"])
 
 
 def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
@@ -736,105 +813,34 @@ with tab_lineage:
 # ── Tab 3: AST vs LLM ────────────────────────────────────────────────────────
 with tab_compare:
     st.caption(
-        "Side-by-side comparison of what each source found independently — "
-        "with the exact source line highlighted underneath, when one exists."
+        "One row per finding, in script order — the code AST parsed, what AST "
+        "concluded, and what the LLM concluded. Where they diverge, that gap "
+        "is the blind spot."
     )
 
-    col_ast, col_llm = st.columns(2)
-
-    with col_ast:
-        st.markdown("### 🔵 AST Parser")
-        st.caption("Static analysis — deterministic, exact, no interpretations.")
-
-        if ast_raw:
-            src_count = len(ast_raw.get("sources", []))
-            tgt_count = len(ast_raw.get("targets", []))
-            jn_count  = len(ast_raw.get("joins", []))
-
-            st.metric("Sources found", src_count)
-            st.metric("Targets found", tgt_count)
-            st.metric("Joins found",   jn_count)
-
-            st.markdown("**Sources:**")
-            if ast_raw.get("sources"):
-                for s in ast_raw["sources"]:
-                    _render_item_with_lines(script_path, s, "sources")
-            else:
-                st.warning("No sources found by AST.", icon="⚠️")
-
-            st.markdown("**Targets:**")
-            if ast_raw.get("targets"):
-                for t in ast_raw["targets"]:
-                    _render_item_with_lines(script_path, t, "targets")
-            else:
-                st.warning("No targets found by AST.", icon="⚠️")
-
-            st.markdown("**Joins:**")
-            if ast_raw.get("joins"):
-                for j in ast_raw["joins"]:
-                    _render_item_with_lines(script_path, j, "joins")
-            else:
-                st.warning("No joins found by AST.", icon="⚠️")
-
-            if ast_raw.get("sql_blocks"):
-                st.markdown("**Embedded SQL:**")
-                for sql in ast_raw["sql_blocks"]:
-                    st.code(sql, language="sql")
-        else:
-            st.info("Run extraction to see AST output.")
-
-    with col_llm:
-        st.markdown("### 🟣 LLM (Claude)")
-        st.caption("Semantic analysis — reads intent, resolves dynamic patterns, adds business context.")
-
-        if llm_raw:
-            src_count = len(llm_raw.get("sources", []))
-            tgt_count = len(llm_raw.get("targets", []))
-            jn_count  = len(llm_raw.get("joins", []))
-
-            st.metric("Sources found", src_count)
-            st.metric("Targets found", tgt_count)
-            st.metric("Joins found",   jn_count)
-
-            st.markdown("**Sources:**")
-            for s in llm_raw.get("sources", []):
-                _render_item_with_lines(script_path, s, "sources")
-
-            st.markdown("**Targets:**")
-            for t in llm_raw.get("targets", []):
-                _render_item_with_lines(script_path, t, "targets")
-
-            st.markdown("**Joins:**")
-            for j in llm_raw.get("joins", []):
-                _render_item_with_lines(script_path, j, "joins")
-        else:
-            st.info("Run extraction to see LLM output.")
-
-    # Delta callout
     if ast_raw and llm_raw:
-        ast_src = {s["dataset"] for s in ast_raw.get("sources", [])}
-        llm_src = {s["dataset"] for s in llm_raw.get("sources", [])}
-        llm_only_src = llm_src - ast_src
-        ast_only_src = ast_src - llm_src
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Sources", f"{len(ast_raw.get('sources',[]))} AST  /  {len(llm_raw.get('sources',[]))} LLM")
+        m2.metric("Targets", f"{len(ast_raw.get('targets',[]))} AST  /  {len(llm_raw.get('targets',[]))} LLM")
+        m3.metric("Joins",   f"{len(ast_raw.get('joins',[]))} AST  /  {len(llm_raw.get('joins',[]))} LLM")
 
-        if llm_only_src or ast_only_src:
-            st.divider()
-            st.markdown("#### Gap Analysis")
-            if llm_only_src:
-                st.error(
-                    f"**LLM recovered {len(llm_only_src)} source(s) the AST missed** "
-                    f"(hidden behind dynamic patterns):\n\n"
-                    + "\n".join(f"- `{s}`" for s in sorted(llm_only_src)),
-                    icon="🤖",
-                )
-            if ast_only_src:
-                st.warning(
-                    f"**AST found {len(ast_only_src)} source(s) the LLM missed:**\n\n"
-                    + "\n".join(f"- `{s}`" for s in sorted(ast_only_src)),
-                    icon="🔵",
-                )
+        df = _unified_compare_df(script_path, ast_raw, llm_raw, merged)
+        if df.empty:
+            st.caption("Nothing found by either source.")
         else:
-            st.success("AST and LLM found the same sources — high confidence extraction.", icon="✅")
+            st.dataframe(
+                df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Line":      st.column_config.TextColumn(width="small"),
+                    "Code":      st.column_config.TextColumn(width="large"),
+                    "AST Found": st.column_config.TextColumn(width="medium"),
+                    "LLM Found": st.column_config.TextColumn(width="large"),
+                },
+            )
+    elif ast_raw:
+        st.info("LLM output not available yet — run extraction to see the comparison.", icon="🟣")
+    else:
+        st.info("Run extraction to see the AST vs LLM comparison.")
 
 
 # ── Tab 4: Business Context ───────────────────────────────────────────────────

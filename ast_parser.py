@@ -43,6 +43,7 @@ def parse_script(source_code: str) -> dict:
         # AST visits outer chain calls first, so renames arrive reversed.
         "column_renames": list(reversed(visitor.column_renames)),
         "sql_blocks":     visitor.sql_blocks,
+        "opaque_logic":   _find_opaque_logic(tree, constants),
     }
 
 
@@ -249,6 +250,98 @@ def _try_resolve_fstring(node: ast.JoinedStr, constants: dict[str, str]) -> str 
         else:
             return None
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Opaque logic detection
+# ---------------------------------------------------------------------------
+
+_OPAQUE_SINKS = {"b64decode", "eval", "exec"}
+
+
+def _find_decoder_functions(tree: ast.Module) -> dict[str, set[int]]:
+    """
+    Find functions whose body pipes one of their own parameters into
+    base64.b64decode() / eval() / exec() — i.e. a helper that executes an
+    opaque payload handed to it by the caller. Returns
+    {function_name: {param_index, ...}}.
+    """
+    decoders: dict[str, set[int]] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        param_names = [a.arg for a in node.args.args]
+        hit_indices: set[int] = set()
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            func_name = (
+                inner.func.attr if isinstance(inner.func, ast.Attribute) else
+                inner.func.id if isinstance(inner.func, ast.Name) else None
+            )
+            if func_name not in _OPAQUE_SINKS:
+                continue
+            for arg in inner.args:
+                names_in_arg = {n.id for n in ast.walk(arg) if isinstance(n, ast.Name)}
+                for i, p in enumerate(param_names):
+                    if p in names_in_arg:
+                        hit_indices.add(i)
+        if hit_indices:
+            decoders[node.name] = hit_indices
+    return decoders
+
+
+def _find_opaque_logic(tree: ast.Module, constants: dict[str, str]) -> list[dict]:
+    """
+    Detect string constants that ultimately feed a base64.b64decode() /
+    eval() / exec() sink — either directly, or via a helper function that
+    decodes/executes one of its own parameters. AST can only see these as a
+    bare Constant node; it has no way to know what the decoded value does.
+    """
+    const_lines: dict[str, int] = {}
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            const_lines[node.targets[0].id] = node.value.lineno
+
+    decoders = _find_decoder_functions(tree)
+    opaque: list[dict] = []
+    seen: set[str] = set()
+
+    def _record(var_name: str):
+        if var_name in seen or var_name not in constants:
+            return
+        seen.add(var_name)
+        raw = constants[var_name]
+        opaque.append({
+            "variable":    var_name,
+            "line":        const_lines.get(var_name),
+            "ast_node":    "Constant (str)",
+            "raw_preview": (raw[:36] + "…") if len(raw) > 36 else raw,
+        })
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Direct sink call: eval(SOME_CONSTANT) / base64.b64decode(SOME_CONSTANT)
+        func_name = (
+            node.func.attr if isinstance(node.func, ast.Attribute) else
+            node.func.id if isinstance(node.func, ast.Name) else None
+        )
+        if func_name in _OPAQUE_SINKS:
+            for arg in node.args:
+                if isinstance(arg, ast.Name):
+                    _record(arg.id)
+        # Call site to a known decoder helper: helper(df, SOME_CONSTANT)
+        if isinstance(node.func, ast.Name) and node.func.id in decoders:
+            for i in decoders[node.func.id]:
+                if i < len(node.args) and isinstance(node.args[i], ast.Name):
+                    _record(node.args[i].id)
+
+    return opaque
 
 
 # ---------------------------------------------------------------------------

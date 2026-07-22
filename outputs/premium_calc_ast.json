@@ -1,5 +1,10 @@
 {
-  "sources": [],
+  "sources": [
+    {
+      "method": "table",
+      "dataset": "reference.territory_rate_factors"
+    }
+  ],
   "targets": [],
   "joins": [
     {
@@ -25,5 +30,6 @@
     }
   ],
   "column_renames": [],
-  "sql_blocks": []
+  "sql_blocks": [],
+  "opaque_logic": []
 }

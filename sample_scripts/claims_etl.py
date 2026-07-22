@@ -1,11 +1,3 @@
-"""
-claims_etl.py
-
-P&C Insurance ETL: joins raw claims with policy master on policy_id,
-applies column renames for downstream consumption, and writes the
-enriched result to the curated layer.
-"""
-
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import DecimalType
@@ -15,18 +7,15 @@ spark = SparkSession.builder \
     .config("spark.sql.shuffle.partitions", "200") \
     .getOrCreate()
 
-# ---- Read sources ----
 claims_df = spark.read.table("raw.claims")
 policy_df = spark.read.table("raw.policy")
 
-# ---- Join claims to policy on policy_id (left join - keep all claims) ----
 joined_df = claims_df.join(
     policy_df,
     claims_df["policy_id"] == policy_df["policy_id"],
     how="left",
 )
 
-# ---- Select and rename columns for downstream consumers ----
 enriched_df = joined_df.select(
     claims_df["claim_id"],
     claims_df["policy_id"],
@@ -44,7 +33,6 @@ enriched_df = joined_df.select(
     policy_df["underwriting_region"],
 )
 
-# Rename raw column names to enterprise standard names
 renamed_df = enriched_df \
     .withColumnRenamed("claim_amount",      "claim_amt_usd") \
     .withColumnRenamed("claim_date",        "claim_dt") \
@@ -56,7 +44,6 @@ renamed_df = enriched_df \
     .withColumnRenamed("expiration_date",   "policy_expiration_dt") \
     .withColumnRenamed("underwriting_region","uw_region_cd")
 
-# ---- Derive additional business fields ----
 final_df = renamed_df \
     .withColumn("claim_amt_usd",     F.col("claim_amt_usd").cast(DecimalType(15, 2))) \
     .withColumn("max_coverage_amt_usd", F.col("max_coverage_amt_usd").cast(DecimalType(15, 2))) \
@@ -68,7 +55,6 @@ final_df = renamed_df \
     .withColumn("etl_load_ts",       F.current_timestamp()) \
     .filter(F.col("claim_amt_usd").isNotNull())
 
-# ---- Write curated output ----
 final_df.write \
     .mode("overwrite") \
     .format("parquet") \

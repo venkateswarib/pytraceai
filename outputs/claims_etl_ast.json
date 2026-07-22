@@ -61,5 +61,6 @@
       "new_name": "uw_region_cd"
     }
   ],
-  "sql_blocks": []
+  "sql_blocks": [],
+  "opaque_logic": []
 }

@@ -2,24 +2,35 @@
   "sources": [
     {
       "method": "table",
-      "dataset": "curated.claims_enriched"
+      "dataset": "raw.policy_premiums"
     },
     {
       "method": "table",
-      "dataset": "raw.customers"
-    },
-    {
-      "method": "parquet",
-      "dataset": "s3://insurance-lake/raw/transactions/"
+      "dataset": "raw.incurred_losses"
     }
   ],
   "targets": [
     {
       "method": "saveAsTable",
-      "dataset": "curated.fraud_flagged_claims"
+      "dataset": "curated.high_risk_policies"
     }
   ],
-  "joins": [],
+  "joins": [
+    {
+      "left": "policies_df",
+      "right": "losses_df",
+      "join_key": "policy_id",
+      "join_type": "inner"
+    }
+  ],
   "column_renames": [],
-  "sql_blocks": []
+  "sql_blocks": [],
+  "opaque_logic": [
+    {
+      "variable": "metadata_payload",
+      "line": 12,
+      "ast_node": "Constant (str)",
+      "raw_preview": "ZGYud2l0aENvbHVtbigiTG9zc19SYXRpbyIs\u2026"
+    }
+  ]
 }
