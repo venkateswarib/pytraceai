@@ -60,6 +60,37 @@ st.markdown("""
     font-size:0.88em;
 }
 
+/* ── Hero banner ── */
+.pytraceai-hero {
+    background: linear-gradient(135deg, #0F172A 0%, #1E3A5F 60%, #2563EB 100%);
+    border-radius: 12px;
+    padding: 28px 36px 22px 36px;
+    margin-bottom: 24px;
+}
+.pytraceai-hero h1 {
+    margin: 0 0 4px 0;
+    font-size: 2.4em;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    color: #FFFFFF;
+}
+.pytraceai-hero .sub {
+    font-size: 1.05em;
+    color: #93C5FD;
+    margin: 0;
+}
+.pytraceai-hero .tagline {
+    display: inline-block;
+    margin-top: 10px;
+    background: rgba(255,255,255,0.12);
+    border: 1px solid rgba(255,255,255,0.2);
+    border-radius: 20px;
+    padding: 4px 14px;
+    font-size: 0.78em;
+    color: #BFDBFE;
+    letter-spacing: 0.06em;
+}
+
 /* Prominent download buttons */
 div[data-testid="stDownloadButton"] button {
     background: linear-gradient(135deg, #3A86FF 0%, #2563EB 100%) !important;
@@ -83,18 +114,24 @@ div[data-testid="stDownloadButton"] button:hover {
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 SCRIPTS = {
-    "claims_etl.py  —  Clean PySpark (baseline)":       "sample_scripts/claims_etl.py",
-    "fraud_detection.py  —  Embedded SQL":               "sample_scripts/fraud_detection.py",
-    "premium_calc.py  —  Config-driven (hard patterns)": "sample_scripts/premium_calc.py",
+    "claims_etl.py  —  Clean PySpark (AST wins)":                  "sample_scripts/claims_etl.py",
+    "fraud_detection.py  —  Encoded formula (blind spot #1)":       "sample_scripts/fraud_detection.py",
+    "premium_calc.py  —  Runtime config (blind spot #2)":           "sample_scripts/premium_calc.py",
 }
 
 SCRIPT_STORY = {
     "sample_scripts/claims_etl.py":
-        "Standard PySpark with literal table names. AST and LLM fully agree. Expect confidence ~100%.",
+        "Clean PySpark with literal table names and explicit transformations. "
+        "AST and LLM fully agree — confidence ~100%. "
+        "Baseline: when code is transparent, AST is fast, exact, and sufficient.",
     "sample_scripts/fraud_detection.py":
-        "Joins live inside a spark.sql() string — invisible to the AST. LLM recovers them. Expect confidence ~87%.",
+        "Sources and target are plain text — AST finds them. "
+        "But the core underwriting formula (Loss_Ratio derivation) is base64-encoded. "
+        "AST sees an opaque string; LLM decodes it and recovers the column-level transformation.",
     "sample_scripts/premium_calc.py":
-        "Config-dict table names, JDBC reads, helper functions, f-strings. AST finds 0 sources. LLM recovers all. Expect confidence ~69%.",
+        "Transformations are explicit — AST reads them fine. "
+        "But table names come from os.environ and config dicts at runtime. "
+        "AST resolves only 1 of 4 sources; LLM infers the full table list from context.",
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -320,8 +357,8 @@ def _load_json(p: Path) -> dict | None:
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## 🔍 PyTraceAi")
-    st.caption("AI-powered PySpark data lineage extraction")
+    st.markdown("### 🔍 PyTraceAi")
+    st.caption("Select a script · Run Extraction · Download lineage")
     st.divider()
 
     selected_name = st.selectbox(
@@ -408,21 +445,27 @@ merged = _load_json(_merged_path(script_path))
 ast_raw = _load_json(_ast_path(script_path))
 llm_raw = _load_json(_llm_path(script_path))
 
+st.markdown("""
+<div class="pytraceai-hero">
+  <h1>🔍 PyTraceAi</h1>
+  <p class="sub">AI-powered PySpark data lineage extraction</p>
+  <span class="tagline">AST  ·  LLM  ·  Confidence scoring  ·  OpenLineage</span>
+</div>
+""", unsafe_allow_html=True)
+
 if merged is None:
     st.markdown("""
-## Welcome to PyTraceAi
+### Select a script and click **Run Extraction** to begin.
 
-Select a script in the sidebar and click **Run Extraction** to begin.
+PyTraceAi combines static AST analysis with an LLM to recover lineage patterns that static parsers cannot reach. Pick each script in order to see the three scenarios:
 
-### The demo story
+| Script | AST blind spot | What AST misses | What LLM recovers |
+|---|---|---|---|
+| `claims_etl.py` | None — clean baseline | Nothing | Nothing new — they agree |
+| `fraud_detection.py` | Base64-encoded formula | `Loss_Ratio` derived column | Decodes the underwriting formula |
+| `premium_calc.py` | Runtime env/config table names | 3 of 4 source tables | Infers full table list from context |
 
-| Script | Pattern | Expected Confidence |
-|---|---|---|
-| `claims_etl.py` | Clean PySpark | ~100% — AST + LLM fully agree |
-| `fraud_detection.py` | Embedded SQL joins | ~87% — AST misses SQL joins |
-| `premium_calc.py` | Config-driven tables | ~69% — AST finds 0 sources |
-
-The confidence score tells you exactly what was statically verified vs AI-inferred.
+The **confidence score** tells you exactly what was statically verified vs AI-inferred.
 """)
     st.stop()
 
@@ -434,7 +477,7 @@ n_src             = len(merged.get("sources", []))
 n_tgt             = len(merged.get("targets", []))
 n_joins           = len(merged.get("joins", []))
 
-st.markdown(f"## {Path(script_path).name}")
+st.markdown(f"### `{Path(script_path).name}`")
 
 c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Overall Confidence",

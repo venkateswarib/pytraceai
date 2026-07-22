@@ -33,7 +33,8 @@ def parse_script(source_code: str) -> dict:
       }
     """
     tree = ast.parse(source_code)
-    visitor = _LineageVisitor()
+    constants = _collect_string_constants(tree)
+    visitor = _LineageVisitor(constants)
     visitor.visit(tree)
     return {
         "sources":        visitor.sources,
@@ -59,7 +60,8 @@ def parse_file(file_path: str) -> dict:
 class _LineageVisitor(ast.NodeVisitor):
     """Walks every Call node in the AST and classifies PySpark operations."""
 
-    def __init__(self):
+    def __init__(self, constants: dict | None = None):
+        self._constants:     dict       = constants or {}
         self.sources:        list[dict] = []
         self.targets:        list[dict] = []
         self.joins:          list[dict] = []
@@ -108,8 +110,10 @@ class _LineageVisitor(ast.NodeVisitor):
         )
 
     def _handle_read(self, node: ast.Call, chain: list[str]):
-        method   = chain[-1]
-        dataset  = _first_string_arg(node)
+        method  = chain[-1]
+        dataset = _first_string_arg(node)
+        if dataset is None:
+            dataset = self._resolve_arg(node)
         if dataset:
             self.sources.append({"method": method, "dataset": dataset})
 
@@ -128,6 +132,8 @@ class _LineageVisitor(ast.NodeVisitor):
     def _handle_write(self, node: ast.Call, chain: list[str]):
         method  = chain[-1]
         dataset = _first_string_arg(node)
+        if dataset is None:
+            dataset = self._resolve_arg(node)
         if dataset:
             self.targets.append({"method": method, "dataset": dataset})
 
@@ -181,8 +187,68 @@ class _LineageVisitor(ast.NodeVisitor):
 
     def _handle_sql(self, node: ast.Call):
         sql_str = _first_string_arg(node)
+        if sql_str is None:
+            sql_str = self._resolve_arg(node)
         if sql_str:
             self.sql_blocks.append(textwrap.dedent(sql_str).strip())
+
+    def _resolve_arg(self, node: ast.Call) -> str | None:
+        """Resolve first arg via constant propagation: Name → string, JoinedStr → string."""
+        if not node.args:
+            return None
+        arg = node.args[0]
+        if isinstance(arg, ast.Name):
+            return self._constants.get(arg.id)
+        if isinstance(arg, ast.JoinedStr):
+            return _try_resolve_fstring(arg, self._constants)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Constant propagation helpers
+# ---------------------------------------------------------------------------
+
+def _collect_string_constants(tree: ast.Module) -> dict[str, str]:
+    """
+    Pre-pass: collect simple  name = "string literal"  assignments,
+    then resolve f-strings whose every template variable is already known.
+    """
+    constants: dict[str, str] = {}
+    # Pass 1 — plain string literals
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)):
+            constants[node.targets[0].id] = node.value.value
+    # Pass 2 — f-strings where every variable is now a known constant
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.JoinedStr)):
+            resolved = _try_resolve_fstring(node.value, constants)
+            if resolved is not None:
+                constants[node.targets[0].id] = resolved
+    return constants
+
+
+def _try_resolve_fstring(node: ast.JoinedStr, constants: dict[str, str]) -> str | None:
+    """Return the concrete string an f-string produces, or None if any variable is unknown."""
+    parts: list[str] = []
+    for value in node.values:
+        if isinstance(value, ast.Constant):
+            parts.append(str(value.value))
+        elif isinstance(value, ast.FormattedValue):
+            inner = value.value
+            if isinstance(inner, ast.Name) and inner.id in constants:
+                parts.append(constants[inner.id])
+            else:
+                return None
+        else:
+            return None
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

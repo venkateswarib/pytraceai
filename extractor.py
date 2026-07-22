@@ -196,19 +196,39 @@ def _merge_joins(ast_joins: list[dict], llm_joins: list[dict]) -> list[dict]:
                 "needs_review": True,
             })
 
-    # LLM-only joins (AST missed them)
+    # LLM-only joins — but skip if the key is already a component of a matched multi-key join
     for i, l in enumerate(llm_joins):
         if i not in used_llm:
-            out.append({
-                "left":        l.get("left"),
-                "right":       l.get("right"),
-                "join_key":    l.get("join_key"),
-                "join_type":   l.get("join_type"),
-                "description": l.get("description", ""),
-                "confidence":  0.60,
-                "source":      "llm_only",
-                "needs_review": True,
-            })
+            l_left  = _norm(l.get("left",  ""))
+            l_right = _norm(l.get("right", ""))
+            l_key   = _norm(str(l.get("join_key", "")))
+            is_subkey = False
+            for matched in out:
+                if matched.get("source") not in ("both", "both_partial"):
+                    continue
+                m_key = matched.get("join_key")
+                if not isinstance(m_key, list):
+                    continue
+                m_left  = _norm(matched.get("left",  ""))
+                m_right = _norm(matched.get("right", ""))
+                same_pair = (
+                    (m_left == l_left or m_left in l_left or l_left in m_left) and
+                    (m_right == l_right or m_right in l_right or l_right in m_right)
+                )
+                if same_pair and l_key in [_norm(k) for k in m_key]:
+                    is_subkey = True
+                    break
+            if not is_subkey:
+                out.append({
+                    "left":        l.get("left"),
+                    "right":       l.get("right"),
+                    "join_key":    l.get("join_key"),
+                    "join_type":   l.get("join_type"),
+                    "description": l.get("description", ""),
+                    "confidence":  0.60,
+                    "source":      "llm_only",
+                    "needs_review": True,
+                })
     return out
 
 
@@ -264,10 +284,13 @@ def _merge_renames(ast_renames: list[dict], llm_renames: list[dict]) -> list[dic
                 "needs_review":   False,
             })
 
-    # LLM-only renames (AST missed them — unusual, worth flagging)
+    # LLM-only renames — skip aggregation expressions misidentified as renames
+    _AGG = re.compile(r"^(sum|avg|count|min|max|first|last|collect_list|collect_set)\s*\(", re.I)
     for r in llm_renames:
         pair = (_norm(r.get("old_name", "")), _norm(r.get("new_name", "")))
         if pair not in used_llm and r.get("old_name") and r.get("new_name"):
+            if _AGG.match(r["old_name"]):
+                continue  # .agg().alias() is not a rename
             out.append({
                 "old_name":       r["old_name"],
                 "new_name":       r["new_name"],
