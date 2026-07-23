@@ -38,5 +38,33 @@
     "avg_earned_premium",
     "policy_count",
     "total_written_premium"
+  ],
+  "filters": [
+    {
+      "condition": "F.col('policy_status') == 'ACTIVE'",
+      "line": 55
+    }
+  ],
+  "derived_columns": [
+    {
+      "column": "calc_ts",
+      "expression": "F.current_timestamp()",
+      "line": 81
+    },
+    {
+      "column": "territory_rank",
+      "expression": "F.rank().over(rank_window)",
+      "line": 96
+    },
+    {
+      "column": "earned_premium",
+      "expression": "F.col('adjusted_premium') * (F.col('policy_term_months') / F.lit(12))",
+      "line": 81
+    },
+    {
+      "column": "adjusted_premium",
+      "expression": "(F.col('written_premium') + F.col('total_endorsement_premium')) * F.col('rate_multiplier')",
+      "line": 81
+    }
   ]
 }

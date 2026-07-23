@@ -37,14 +37,16 @@ def parse_script(source_code: str) -> dict:
     visitor = _LineageVisitor(constants)
     visitor.visit(tree)
     return {
-        "sources":        visitor.sources,
-        "targets":        visitor.targets,
-        "joins":          visitor.joins,
+        "sources":         visitor.sources,
+        "targets":         visitor.targets,
+        "joins":           visitor.joins,
         # AST visits outer chain calls first, so renames arrive reversed.
-        "column_renames": list(reversed(visitor.column_renames)),
-        "sql_blocks":     visitor.sql_blocks,
-        "opaque_logic":   _find_opaque_logic(tree, constants),
-        "agg_aliases":    _find_agg_aliases(tree),
+        "column_renames":  list(reversed(visitor.column_renames)),
+        "sql_blocks":      visitor.sql_blocks,
+        "opaque_logic":    _find_opaque_logic(tree, constants),
+        "agg_aliases":     _find_agg_aliases(tree),
+        "filters":         _find_filters(tree),
+        "derived_columns": _find_derived_columns(tree),
     }
 
 
@@ -251,6 +253,47 @@ def _try_resolve_fstring(node: ast.JoinedStr, constants: dict[str, str]) -> str 
         else:
             return None
     return "".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Filter / derived-column detection
+# ---------------------------------------------------------------------------
+
+def _find_filters(tree: ast.Module) -> list[dict]:
+    """
+    Detect .filter(<condition>) / .where(<condition>) calls. AST can read
+    the raw boolean condition directly — this is plain, visible syntax, not
+    a blind spot — so it can be compared side by side against the LLM's
+    business-language explanation of *why* the filter exists.
+    """
+    filters: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in ("filter", "where") and node.args):
+            continue
+        condition = _expr_to_str(node.args[0])
+        if condition:
+            filters.append({"condition": condition, "line": node.lineno})
+    return filters
+
+
+def _find_derived_columns(tree: ast.Module) -> list[dict]:
+    """
+    Detect .withColumn("name", <expr>) calls. Like filters, this is plain
+    visible syntax — AST can read both the new column name and the raw
+    expression that computes it, for comparison against the LLM's semantic
+    description of the derivation.
+    """
+    derived: list[dict] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "withColumn" and len(node.args) >= 2):
+            continue
+        name = _first_string_arg(node)
+        expr = _expr_to_str(node.args[1])
+        if name and expr:
+            derived.append({"column": name, "expression": expr, "line": node.lineno})
+    return derived
 
 
 # ---------------------------------------------------------------------------

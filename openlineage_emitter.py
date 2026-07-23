@@ -32,7 +32,7 @@ def _infer_namespace(dataset: str) -> tuple:
 
 def to_openlineage(merged: dict, script_name: str) -> dict:
     """Convert a merged lineage dict to an OpenLineage RunEvent dict."""
-    run_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"pytraceai.{script_name}"))
+    run_id = str(uuid.uuid4())
     now    = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     inputs = []

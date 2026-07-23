@@ -281,13 +281,22 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
     docstring_lines = _docstring_lines(script_path)
 
     section = item.get("section", "")
+    stop_at_first_hit = True
     if section in ("sources", "targets"):
         dataset = item.get("dataset", "")
-        candidates = [dataset]
-        if dataset.startswith("jdbc:"):
-            candidates.append(dataset.split("/")[-1])
+        if dataset.startswith("jdbc:") and "/" in dataset:
+            # A jdbc dataset is assembled from two independent script
+            # locations — the connection URL (often in a config dict) and
+            # the table name (often in a separate SQL query string). Both
+            # are needed to explain where the value came from, so search
+            # for both instead of stopping once one of them is found.
+            url_part, _, table_part = dataset.rpartition("/")
+            candidates = [table_part, url_part]
+            stop_at_first_hit = False
         elif "." in dataset:
-            candidates.append(dataset.split(".", 1)[1])
+            candidates = [dataset, dataset.split(".", 1)[1]]
+        else:
+            candidates = [dataset]
     elif section == "joins":
         key = item.get("join_key", "")
         key_list = key if isinstance(key, list) else ([key] if key else [])
@@ -305,6 +314,7 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
     for term in candidates:
         if not term:
             continue
+        found_this_term = False
         for i, line in enumerate(lines, 1):
             if i in docstring_lines:
                 continue
@@ -314,9 +324,10 @@ def _find_code_refs(script_path: str, item: dict) -> list[tuple[int, str]]:
                 if entry not in seen:
                     seen.add(entry)
                     hits.append(entry)
+                    found_this_term = True
                     if len(hits) >= 3:
                         return hits
-        if hits:
+        if found_this_term and stop_at_first_hit:
             break
     return hits
 
@@ -366,7 +377,12 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
                 fake = {"section": section, "dataset": item.get("dataset", "")}
 
             refs = _find_code_refs(script_path, fake)
-            line, snippet = (refs[0][0], refs[0][1]) if refs else (None, "—")
+            if refs:
+                sort_line   = refs[0][0]  # earliest matching line — sort position only
+                display_line = ", ".join(str(ln) for ln, _ in refs)
+                snippet      = " | ".join(f"L{ln}: {snip}" for ln, snip in refs) if len(refs) > 1 else refs[0][1]
+            else:
+                sort_line, display_line, snippet = None, None, "—"
 
             ast_cell = label if src in ("both", "ast_only", "both_partial") else "🚫 not found"
             if src in ("both", "llm_only", "both_partial"):
@@ -376,7 +392,8 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
                 llm_cell = "—"
 
             rows.append({
-                "line": line, "snippet": snippet, "ast": ast_cell, "llm": llm_cell,
+                "sort_line": sort_line, "line": display_line, "snippet": snippet,
+                "ast": ast_cell, "llm": llm_cell,
                 "confidence": f"{item.get('confidence', 1.0) * 100:.0f}%",
                 "review": "⚠️ Y" if item.get("needs_review") else "✅ N",
             })
@@ -386,11 +403,35 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
     add_merged_section("joins",          merged.get("joins", []))
     add_merged_section("column_renames", merged.get("column_renames", []))
 
-    derived = [t for t in merged.get("transformations", []) if t.get("type") == "derive"]
-    for i, o in enumerate(ast_raw.get("opaque_logic", [])):
-        d = derived[i] if i < len(derived) else None
+    # Filters — AST reads the raw boolean condition (plain syntax, not a
+    # blind spot); paired positionally against the LLM's filter-type
+    # transformations, since neither side has a natural join key.
+    llm_filters = [t for t in merged.get("transformations", []) if t.get("type") == "filter"]
+    for i, f in enumerate(ast_raw.get("filters", [])):
+        d = llm_filters[i] if i < len(llm_filters) else None
         rows.append({
-            "line":       o.get("line"),
+            "sort_line":  f.get("line"),
+            "line":       (str(f["line"]) if f.get("line") is not None else None),
+            "snippet":    f'.filter({f["condition"]})',
+            "ast":        f'✅ {f["condition"]}',
+            "llm":        d["description"] if d else "—",
+            "confidence": "100%" if d else "75%",
+            "review":     "✅ N" if d else "⚠️ Y",
+        })
+
+    # Derived columns and the opaque-logic special case both draw from the
+    # same LLM derive-type pool. Opaque logic (encoded, AST cannot read the
+    # expression at all) gets first claim on those entries; ordinary
+    # .withColumn() calls (AST reads the expression directly, no blind
+    # spot) take whatever's left, so a derive-type transformation is never
+    # double-counted across both categories.
+    derived_all = [t for t in merged.get("transformations", []) if t.get("type") == "derive"]
+    opaque = ast_raw.get("opaque_logic", [])
+    for i, o in enumerate(opaque):
+        d = derived_all[i] if i < len(derived_all) else None
+        rows.append({
+            "sort_line":  o.get("line"),
+            "line":       (str(o["line"]) if o.get("line") is not None else None),
             "snippet":    f'{o["variable"]} = "{o["raw_preview"]}"',
             "ast":        f'⚠️ {o["ast_node"]} — opaque, cannot execute or decode',
             "llm":        d["description"] if d else "Run/re-run extraction to decode this payload.",
@@ -398,10 +439,24 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
             "review":     "⚠️ Y",
         })
 
-    rows.sort(key=lambda r: (r["line"] is None, r["line"] or 0))
+    remaining_derived = derived_all[len(opaque):]
+    for i, dc in enumerate(ast_raw.get("derived_columns", [])):
+        d = remaining_derived[i] if i < len(remaining_derived) else None
+        expr_preview = dc["expression"][:60] + ("…" if len(dc["expression"]) > 60 else "")
+        rows.append({
+            "sort_line":  dc.get("line"),
+            "line":       (str(dc["line"]) if dc.get("line") is not None else None),
+            "snippet":    f'.withColumn("{dc["column"]}", {expr_preview})',
+            "ast":        f'✅ {dc["column"]} = {expr_preview}',
+            "llm":        d["description"] if d else "—",
+            "confidence": "100%" if d else "75%",
+            "review":     "✅ N" if d else "⚠️ Y",
+        })
+
+    rows.sort(key=lambda r: (r["sort_line"] is None, r["sort_line"] or 0))
     cols = ["Line", "Code", "AST Found", "LLM Found", "Confidence", "Needs Review"]
     return pd.DataFrame([
-        {"Line": (str(r["line"]) if r["line"] is not None else "—"), "Code": r["snippet"],
+        {"Line": (r["line"] if r["line"] is not None else "—"), "Code": r["snippet"],
          "AST Found": r["ast"], "LLM Found": r["llm"],
          "Confidence": r["confidence"], "Needs Review": r["review"]}
         for r in rows
