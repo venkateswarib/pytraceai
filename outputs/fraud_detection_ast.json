@@ -29,9 +29,21 @@
     {
       "variable": "metadata_payload",
       "line": 12,
+      "related_lines": [
+        12,
+        17,
+        22
+      ],
       "ast_node": "Constant (str)",
       "raw_preview": "ZGYud2l0aENvbHVtbigiTG9zc19SYXRpbyIs\u2026"
     }
   ],
-  "agg_aliases": []
+  "agg_aliases": [],
+  "filters": [
+    {
+      "condition": "final_df.Loss_Ratio > 75.0",
+      "line": 24
+    }
+  ],
+  "derived_columns": []
 }

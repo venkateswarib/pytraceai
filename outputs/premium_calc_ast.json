@@ -42,29 +42,29 @@
   "filters": [
     {
       "condition": "F.col('policy_status') == 'ACTIVE'",
-      "line": 55
+      "line": 57
     }
   ],
   "derived_columns": [
     {
       "column": "calc_ts",
       "expression": "F.current_timestamp()",
-      "line": 81
+      "line": 92
     },
     {
       "column": "territory_rank",
       "expression": "F.rank().over(rank_window)",
-      "line": 96
+      "line": 104
     },
     {
       "column": "earned_premium",
       "expression": "F.col('adjusted_premium') * (F.col('policy_term_months') / F.lit(12))",
-      "line": 81
+      "line": 88
     },
     {
       "column": "adjusted_premium",
       "expression": "(F.col('written_premium') + F.col('total_endorsement_premium')) * F.col('rate_multiplier')",
-      "line": 81
+      "line": 83
     }
   ]
 }

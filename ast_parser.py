@@ -273,7 +273,11 @@ def _find_filters(tree: ast.Module) -> list[dict]:
             continue
         condition = _expr_to_str(node.args[0])
         if condition:
-            filters.append({"condition": condition, "line": node.lineno})
+            # Use the argument's own line, not the Call node's — for a
+            # multi-line chained call, Call.lineno points at the start of
+            # the whole chain (e.g. the assignment target several lines
+            # above), not at this specific .filter(...) site.
+            filters.append({"condition": condition, "line": node.args[0].lineno})
     return filters
 
 
@@ -292,7 +296,9 @@ def _find_derived_columns(tree: ast.Module) -> list[dict]:
         name = _first_string_arg(node)
         expr = _expr_to_str(node.args[1])
         if name and expr:
-            derived.append({"column": name, "expression": expr, "line": node.lineno})
+            # Same reasoning as _find_filters: anchor on the first
+            # argument's own line, not the chained Call node's line.
+            derived.append({"column": name, "expression": expr, "line": node.args[0].lineno})
     return derived
 
 
@@ -336,14 +342,14 @@ def _find_agg_aliases(tree: ast.Module) -> list[str]:
 _OPAQUE_SINKS = {"b64decode", "eval", "exec"}
 
 
-def _find_decoder_functions(tree: ast.Module) -> dict[str, set[int]]:
+def _find_decoder_functions(tree: ast.Module) -> dict[str, tuple[int, set[int]]]:
     """
     Find functions whose body pipes one of their own parameters into
     base64.b64decode() / eval() / exec() — i.e. a helper that executes an
     opaque payload handed to it by the caller. Returns
-    {function_name: {param_index, ...}}.
+    {function_name: (def_lineno, {param_index, ...})}.
     """
-    decoders: dict[str, set[int]] = {}
+    decoders: dict[str, tuple[int, set[int]]] = {}
     for node in ast.walk(tree):
         if not isinstance(node, ast.FunctionDef):
             continue
@@ -364,7 +370,7 @@ def _find_decoder_functions(tree: ast.Module) -> dict[str, set[int]]:
                     if p in names_in_arg:
                         hit_indices.add(i)
         if hit_indices:
-            decoders[node.name] = hit_indices
+            decoders[node.name] = (node.lineno, hit_indices)
     return decoders
 
 
@@ -374,6 +380,13 @@ def _find_opaque_logic(tree: ast.Module, constants: dict[str, str]) -> list[dict
     eval() / exec() sink — either directly, or via a helper function that
     decodes/executes one of its own parameters. AST can only see these as a
     bare Constant node; it has no way to know what the decoded value does.
+
+    Captures every line involved in the chain — the constant's own
+    assignment, the decoder helper's definition (if any), and the call
+    site that actually triggers the decode/exec — not just the constant's
+    assignment line alone. Understanding this blind spot requires seeing
+    all three together: where the payload is defined, what decodes it, and
+    where that decoding is actually invoked.
     """
     const_lines: dict[str, int] = {}
     for node in ast.walk(tree):
@@ -388,16 +401,18 @@ def _find_opaque_logic(tree: ast.Module, constants: dict[str, str]) -> list[dict
     opaque: list[dict] = []
     seen: set[str] = set()
 
-    def _record(var_name: str):
+    def _record(var_name: str, extra_lines: list[int]):
         if var_name in seen or var_name not in constants:
             return
         seen.add(var_name)
         raw = constants[var_name]
+        related = sorted({ln for ln in (const_lines.get(var_name), *extra_lines) if ln is not None})
         opaque.append({
-            "variable":    var_name,
-            "line":        const_lines.get(var_name),
-            "ast_node":    "Constant (str)",
-            "raw_preview": (raw[:36] + "…") if len(raw) > 36 else raw,
+            "variable":      var_name,
+            "line":          const_lines.get(var_name),
+            "related_lines": related,
+            "ast_node":      "Constant (str)",
+            "raw_preview":   (raw[:36] + "…") if len(raw) > 36 else raw,
         })
 
     for node in ast.walk(tree):
@@ -411,12 +426,13 @@ def _find_opaque_logic(tree: ast.Module, constants: dict[str, str]) -> list[dict
         if func_name in _OPAQUE_SINKS:
             for arg in node.args:
                 if isinstance(arg, ast.Name):
-                    _record(arg.id)
+                    _record(arg.id, [node.lineno])
         # Call site to a known decoder helper: helper(df, SOME_CONSTANT)
         if isinstance(node.func, ast.Name) and node.func.id in decoders:
-            for i in decoders[node.func.id]:
+            def_line, indices = decoders[node.func.id]
+            for i in indices:
                 if i < len(node.args) and isinstance(node.args[i], ast.Name):
-                    _record(node.args[i].id)
+                    _record(node.args[i].id, [def_line, node.lineno])
 
     return opaque
 

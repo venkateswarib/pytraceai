@@ -63,8 +63,12 @@ Return a JSON object with EXACTLY this structure (no extra keys):
   ],
   "sql_blocks": ["<raw SQL string verbatim, if any>"],
   "transformations": [
-    {{"type":        "<filter | aggregate | derive | cast | window>",
-      "description": "<one sentence: what this transformation computes>"}}
+    {{"type":           "<filter | aggregate | derive | cast | window>",
+      "input_df":       "<DataFrame variable name this transformation reads from>",
+      "output_df":      "<DataFrame variable name this transformation produces>",
+      "source_columns": ["<actual column name(s) the transformation reads — decode first if hidden behind encoding/exec/eval>"],
+      "output_column":  "<column name this transformation produces (derive/cast only; omit for filter/aggregate/window)>",
+      "description":    "<one sentence: what this transformation computes. If the logic is hidden behind encoding or dynamic execution (base64, exec, eval), decode it and state the EXACT formula/condition and the real source column names — never say 'applies a rule' without naming the columns and formula>"}}
   ],
   "business_summary": "<2-3 sentences: plain-English summary of the script's purpose and downstream consumers>"
 }}

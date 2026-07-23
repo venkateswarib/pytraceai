@@ -429,12 +429,25 @@ def _unified_compare_df(script_path: str, ast_raw: dict, llm_raw: dict, merged: 
     opaque = ast_raw.get("opaque_logic", [])
     for i, o in enumerate(opaque):
         d = derived_all[i] if i < len(derived_all) else None
+        # related_lines covers the whole chain — payload assignment,
+        # decoder function definition, and the call site that invokes it —
+        # not just the assignment line alone. A reader needs all three to
+        # see the full blind spot: where it's defined, what decodes it, and
+        # where that decoding actually fires.
+        related = o.get("related_lines") or [o.get("line")]
+        display_line = ", ".join(str(ln) for ln in related if ln is not None)
+        llm_cell = "Run/re-run extraction to decode this payload."
+        if d:
+            io_note = ""
+            if d.get("input_df") and d.get("output_df"):
+                io_note = f" (applied to {d['input_df']}, produces {d['output_df']})"
+            llm_cell = d["description"] + io_note
         rows.append({
             "sort_line":  o.get("line"),
-            "line":       (str(o["line"]) if o.get("line") is not None else None),
-            "snippet":    f'{o["variable"]} = "{o["raw_preview"]}"',
+            "line":       (display_line if display_line else None),
+            "snippet":    f'L{o.get("line")}: {o["variable"]} = "{o["raw_preview"]}"  (decoded + invoked — see lines {display_line})',
             "ast":        f'⚠️ {o["ast_node"]} — opaque, cannot execute or decode',
-            "llm":        d["description"] if d else "Run/re-run extraction to decode this payload.",
+            "llm":        llm_cell,
             "confidence": "60%" if d else "—",
             "review":     "⚠️ Y",
         })
@@ -468,6 +481,13 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
     rows = []
     targets  = merged.get("targets", [])
     tgt_name = targets[0]["dataset"] if targets else Path(script_path).stem
+    # Approximation: renames/derivations happen on an in-flight dataframe
+    # read from one of these upstream tables, not from the target itself —
+    # showing tgt_name as its own source is a self-loop that says nothing.
+    # We don't track which specific source a given column came from when
+    # there are multiple, so all sources are listed together rather than
+    # guessed at per-column.
+    src_names = ", ".join(s["dataset"] for s in merged.get("sources", [])) or "(sources)"
 
     def _ref_fields(fake_item: dict) -> tuple[str, str]:
         """Return (line_number_str, code_snippet_str) for a lineage item."""
@@ -501,7 +521,9 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
                 "Code Snippet":     snippet,
             })
 
-    # 2. Join rows
+    # 2. Join rows — a join has TWO inputs and ONE output (a new, intermediate
+    # dataframe); the right side is not a "target" of the left side, so both
+    # go under Source, and Target reflects the actual downstream dataset.
     for j in merged.get("joins", []):
         nr      = j.get("needs_review", False)
         key     = j.get("join_key", "")
@@ -511,11 +533,11 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
                    "left": j.get("left", ""), "right": j.get("right", "")}
         lineno, snippet = _ref_fields(fake)
         rows.append({
-            "Source Dataset":   j.get("left", ""),
+            "Source Dataset":   f"{j.get('left','?')} ⋈ {j.get('right','?')}",
             "Source Column":    key_str,
-            "Target Dataset":   j.get("right", ""),
-            "Target Column":    key_str,
-            "Transformation":   f"{j.get('join_type','').upper()} JOIN",
+            "Target Dataset":   tgt_name,
+            "Target Column":    "",
+            "Transformation":   f"{j.get('join_type','').upper()} JOIN on {key_str}",
             "Confidence":       f"{j.get('confidence', 1.0)*100:.1f}%",
             "Needs Review":     "Y" if nr else "N",
             "Suggested Action": _suggested_action(fake) if nr else "",
@@ -532,7 +554,7 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
         label   = f"rename — {reason}" if reason else "rename"
         lineno, snippet = _ref_fields(fake)
         rows.append({
-            "Source Dataset":   tgt_name,
+            "Source Dataset":   src_names,
             "Source Column":    r.get("old_name", ""),
             "Target Dataset":   tgt_name,
             "Target Column":    r.get("new_name", ""),
@@ -544,14 +566,25 @@ def _build_lineage_map(merged: dict, script_path: str) -> pd.DataFrame:
             "Code Snippet":     snippet,
         })
 
-    # 4. LLM-inferred transformations (description-level)
+    # 4. LLM-inferred transformations (description-level). These are not
+    # column-copy mappings — Source Dataset must NOT repeat tgt_name as
+    # both source and target (a self-loop that says nothing). A filter is
+    # a row-level constraint, not a column mapping, and is labelled as such
+    # rather than left with blank source/target columns that look like a
+    # broken mapping row.
     for t in merged.get("transformations", []):
+        t_type = t.get("type", "")
+        source_cols = t.get("source_columns") or []
+        if t_type == "filter":
+            src_col, tgt_col = ", ".join(source_cols), "(row-level filter — not a column mapping)"
+        else:
+            src_col, tgt_col = ", ".join(source_cols), (t.get("output_column") or "")
         rows.append({
-            "Source Dataset":   tgt_name,
-            "Source Column":    "",
+            "Source Dataset":   src_names,
+            "Source Column":    src_col,
             "Target Dataset":   tgt_name,
-            "Target Column":    "",
-            "Transformation":   f"{t.get('type','').title()}: {t.get('description','')}",
+            "Target Column":    tgt_col,
+            "Transformation":   f"{t_type.title()}: {t.get('description','')}",
             "Confidence":       f"{t.get('confidence', 1.0)*100:.1f}%" if t.get("confidence") else "—",
             "Needs Review":     "N",
             "Suggested Action": "",

@@ -30,6 +30,60 @@ def _infer_namespace(dataset: str) -> tuple:
     return "hive://default", dataset
 
 
+def _column_lineage_facet(merged: dict) -> dict | None:
+    """
+    Build a ColumnLineageDatasetFacet: DIRECT transformations for renames
+    and derived columns (value is copied/computed from named source
+    columns), INDIRECT for joins and filters (they affect which rows
+    survive, not a specific column's value, so they must not be reported
+    as a direct copy). Source-column attribution is approximate — the
+    pipeline does not track which specific upstream table each column
+    came from, so all source columns are attributed to the first source
+    dataset rather than guessed per-column.
+    """
+    sources = merged.get("sources", [])
+    if not sources:
+        return None
+    src_ns, src_name = _infer_namespace(sources[0]["dataset"])
+
+    fields: dict = {}
+    for r in merged.get("column_renames", []):
+        fields[r["new_name"]] = {
+            "inputFields": [{"namespace": src_ns, "name": src_name, "field": r["old_name"]}],
+            "transformations": [{"type": "DIRECT", "subtype": "IDENTITY",
+                                  "description": r.get("business_reason", "column rename")}],
+        }
+    for t in merged.get("transformations", []):
+        out_col = t.get("output_column")
+        if not out_col:
+            continue
+        cols = t.get("source_columns") or []
+        fields[out_col] = {
+            "inputFields": [{"namespace": src_ns, "name": src_name, "field": c} for c in cols]
+                           or [{"namespace": src_ns, "name": src_name, "field": "*"}],
+            "transformations": [{"type": "DIRECT", "subtype": "TRANSFORMATION",
+                                  "description": t.get("description", "")}],
+        }
+    if not fields:
+        return None
+
+    indirect = []
+    for j in merged.get("joins", []):
+        key = j.get("join_key", "")
+        key_str = ", ".join(key) if isinstance(key, list) else str(key)
+        indirect.append({"type": "INDIRECT", "subtype": "JOIN",
+                          "description": f"{j.get('join_type','').upper()} JOIN on {key_str}"})
+    for t in merged.get("transformations", []):
+        if t.get("type") == "filter":
+            indirect.append({"type": "INDIRECT", "subtype": "CONDITION",
+                              "description": t.get("description", "")})
+    if indirect:
+        for f in fields.values():
+            f["transformations"] = f["transformations"] + indirect
+
+    return {"fields": fields}
+
+
 def to_openlineage(merged: dict, script_name: str) -> dict:
     """Convert a merged lineage dict to an OpenLineage RunEvent dict."""
     run_id = str(uuid.uuid4())
@@ -58,28 +112,33 @@ def to_openlineage(merged: dict, script_name: str) -> dict:
             },
         })
 
+    col_lineage = _column_lineage_facet(merged)
+
     outputs = []
     for tgt in merged.get("targets", []):
         ns, name = _infer_namespace(tgt["dataset"])
-        outputs.append({
-            "namespace": ns,
-            "name": name,
-            "facets": {
-                "dataSource": {
-                    "_producer": PRODUCER,
-                    "_schemaURL": f"{SCHEMA_URL}#/definitions/DataSourceDatasetFacet",
-                    "name": tgt["dataset"],
-                    "uri": tgt["dataset"],
-                },
-                "pytraceai_confidence": {
-                    "_producer": PRODUCER,
-                    "_schemaURL": SCHEMA_URL,
-                    "score": round(tgt.get("confidence", 1.0), 4),
-                    "extractedBy": tgt.get("source", "both"),
-                    "needsReview": tgt.get("needs_review", False),
-                },
+        facets = {
+            "dataSource": {
+                "_producer": PRODUCER,
+                "_schemaURL": f"{SCHEMA_URL}#/definitions/DataSourceDatasetFacet",
+                "name": tgt["dataset"],
+                "uri": tgt["dataset"],
             },
-        })
+            "pytraceai_confidence": {
+                "_producer": PRODUCER,
+                "_schemaURL": SCHEMA_URL,
+                "score": round(tgt.get("confidence", 1.0), 4),
+                "extractedBy": tgt.get("source", "both"),
+                "needsReview": tgt.get("needs_review", False),
+            },
+        }
+        if col_lineage:
+            facets["columnLineage"] = {
+                "_producer": PRODUCER,
+                "_schemaURL": f"{SCHEMA_URL}#/definitions/ColumnLineageDatasetFacet",
+                **col_lineage,
+            }
+        outputs.append({"namespace": ns, "name": name, "facets": facets})
 
     return {
         "eventType": "COMPLETE",

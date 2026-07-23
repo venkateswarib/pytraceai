@@ -67,39 +67,39 @@
   "filters": [
     {
       "condition": "F.col('claim_amt_usd').isNotNull()",
-      "line": 47
+      "line": 56
     }
   ],
   "derived_columns": [
     {
       "column": "etl_load_ts",
       "expression": "F.current_timestamp()",
-      "line": 47
+      "line": 55
     },
     {
       "column": "is_catastrophic",
       "expression": "F.when(F.col('claim_amt_usd') > 500000, F.lit(True)).otherwise(F.lit(False))",
-      "line": 47
+      "line": 53
     },
     {
       "column": "net_payable_amt",
       "expression": "F.greatest(F.col('claim_amt_usd') - F.col('deductible_amt_usd'), F.lit(0))",
-      "line": 47
+      "line": 51
     },
     {
       "column": "deductible_amt_usd",
       "expression": "F.col('deductible_amt_usd').cast(DecimalType(15, 2))",
-      "line": 47
+      "line": 50
     },
     {
       "column": "max_coverage_amt_usd",
       "expression": "F.col('max_coverage_amt_usd').cast(DecimalType(15, 2))",
-      "line": 47
+      "line": 49
     },
     {
       "column": "claim_amt_usd",
       "expression": "F.col('claim_amt_usd').cast(DecimalType(15, 2))",
-      "line": 47
+      "line": 48
     }
   ]
 }
